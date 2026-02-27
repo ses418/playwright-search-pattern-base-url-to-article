@@ -1,30 +1,29 @@
-FROM python:3.10-slim
+# ==========================================================
+# Article Scraper API — FastAPI + Playwright
+# Production-Ready (Coolify / Ubuntu Compatible)
+# ==========================================================
 
-RUN apt-get update && apt-get install -y \
-    tini \
-    chromium \
-    chromium-driver \
-    fonts-liberation \
-    libnss3 \
-    libxss1 \
-    libasound2 \
-    libatk-bridge2.0-0 \
-    libgtk-3-0 \
-    libgbm1 \
-    && rm -rf /var/lib/apt/lists/*
+# Official Microsoft Playwright image (Ubuntu Jammy based)
+FROM mcr.microsoft.com/playwright/python:v1.47.0-jammy
 
+# Prevent Python buffering
 ENV PYTHONUNBUFFERED=1
-ENV PLAYWRIGHT_BROWSERS_PATH=/usr/bin
-ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 
+# Set working directory
 WORKDIR /app
 
+# Copy requirements first (better Docker layer caching)
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
 
+# Install Python dependencies
+RUN pip install --upgrade pip \
+    && pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
 COPY . .
 
+# Expose FastAPI port
 EXPOSE 5060
 
-ENTRYPOINT ["/usr/bin/tini", "--"]
+# Start FastAPI
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "5060"]
