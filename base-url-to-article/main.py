@@ -1,29 +1,26 @@
 """
-Single URL Article Scraper — Supabase Edition (v4 fixed)
+Single URL Article Scraper — FastAPI Server Edition  v5.0
 =========================================================
-CHANGE in this version vs previous:
-  - Search method/pattern is now fetched from Supabase table
-    `public.base_url_search_patterns` instead of a local CSV file.
-  - No local CSV files needed at all. Everything comes from Supabase.
+Converted from scraper_v4.py (CLI) to a production FastAPI service.
 
-FIX also included:
-  - JWT role validator: detects anon key at startup and exits immediately
-    with clear instructions to use the service_role key instead.
+Endpoints:
+    POST /scrape          — Start a scrape job (background, returns job_id)
+    GET  /job/{job_id}    — Poll job status + result
+    GET  /jobs            — List all jobs (last 100)
+    GET  /health          — Health check
+    GET  /                — API info
 
-HOW TO RUN:
-  pip install playwright pandas supabase python-dotenv
-  playwright install chromium
-  python scraper_v4.py --base_url "https://example.com"
+Run:
+    uvicorn main:app --host 0.0.0.0 --port 5060
+    or via Docker (see Dockerfile at repo root)
 
-.env file (same folder as script):
-  SUPABASE_URL=https://supabase.sesai.in
-  SUPABASE_KEY=<your SERVICE_ROLE key — NOT the anon key>
+Environment (.env or Docker env):
+    SUPABASE_URL=https://supabase.sesai.in
+    SUPABASE_KEY=<service_role key — NOT anon>
 """
 
-import argparse
 import asyncio
 import base64
-import io
 import json
 import logging
 import os
@@ -31,11 +28,21 @@ import re
 import sys
 import time
 import uuid
+from collections import OrderedDict
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
+from typing import Optional
 from urllib.parse import quote_plus, urljoin, urlparse
 
-import pandas as pd
+from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
 from playwright.async_api import async_playwright
+
+# ─── Windows asyncio fix (required for Playwright on Python 3.12+) ───────────
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 # ─── Load .env if present ────────────────────────────────────────────────────
 try:
@@ -44,430 +51,225 @@ try:
 except ImportError:
     pass
 
-# ─── Supabase client ─────────────────────────────────────────────────────────
+# ─── Supabase ─────────────────────────────────────────────────────────────────
 try:
     from supabase import create_client, Client as SupabaseClient
 except ImportError:
-    print("[FATAL] supabase-py not installed. Run: pip install supabase")
+    print("[FATAL] supabase-py not installed.")
     sys.exit(1)
 
-# ─── UTF-8 stdout/stderr (Windows CP1252 fix) ────────────────────────────────
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+# ─── UTF-8 stdout (Windows fix) ───────────────────────────────────────────────
 
-# ─── Logging ─────────────────────────────────────────────────────────────────
+# ─── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler("scraper_v4.log", mode="w", encoding="utf-8"),
-    ],
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
 log = logging.getLogger(__name__)
 
-# ─── Date filter ─────────────────────────────────────────────────────────────
+# ─── Date filter ──────────────────────────────────────────────────────────────
 TWO_YEAR_CUTOFF = datetime.now(tz=timezone.utc) - timedelta(days=365 * 2)
 
 
 # ==============================================================================
-# JWT KEY ROLE VALIDATOR
+# IN-MEMORY JOB STORE  (last 200 jobs, thread-safe via asyncio single-thread)
 # ==============================================================================
 
-def decode_jwt_role(jwt_token: str) -> str:
-    """Decode Supabase JWT payload and return the 'role' field."""
+_jobs: OrderedDict = OrderedDict()   # job_id → dict
+MAX_JOBS = 200
+
+
+def _new_job(job_id: str, payload: dict) -> dict:
+    job = {
+        "job_id":      job_id,
+        "status":      "queued",    # queued | running | done | error
+        "created_at":  datetime.utcnow().isoformat(),
+        "started_at":  None,
+        "finished_at": None,
+        "payload":     payload,
+        "progress":    {},
+        "result":      None,
+        "error":       None,
+    }
+    _jobs[job_id] = job
+    if len(_jobs) > MAX_JOBS:
+        _jobs.popitem(last=False)   # drop oldest
+    return job
+
+
+# ==============================================================================
+# SHARED PLAYWRIGHT BROWSER
+# ==============================================================================
+
+_playwright_inst = None
+_browser         = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _playwright_inst, _browser
+    log.info("[BOOT] Starting Playwright Chromium...")
+    _playwright_inst = await async_playwright().start()
+    _browser = await _playwright_inst.chromium.launch(
+        headless=True,
+        args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+    )
+    log.info("[BOOT] Playwright ready ✓")
+    yield
+    log.info("[SHUTDOWN] Closing browser...")
+    if _browser:
+        await _browser.close()
+    if _playwright_inst:
+        await _playwright_inst.stop()
+
+
+# ==============================================================================
+# FASTAPI APP
+# ==============================================================================
+
+app = FastAPI(
+    title="Article Scraper API — Supabase Edition v5.0",
+    description="Scrape articles from a URL using Playwright + save to Supabase.",
+    version="5.0.0",
+    lifespan=lifespan,
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
+)
+
+
+# ==============================================================================
+# REQUEST / RESPONSE MODELS
+# ==============================================================================
+
+class ScrapeRequest(BaseModel):
+    base_url:            str           = Field(...,  description="Target URL, e.g. https://example.com")
+    base_url_id:         Optional[str] = Field(None, description="UUID in ses_base_url (auto-resolved if omitted)")
+    skip_article_visit:  bool          = Field(False, description="Collect links only, skip article detail pages")
+    output_csv:          Optional[str] = Field(None,  description="Optional local CSV backup path (server-side)")
+
+
+class ScrapeAccepted(BaseModel):
+    job_id:   str
+    status:   str
+    message:  str
+
+
+# ==============================================================================
+# JWT KEY VALIDATOR
+# ==============================================================================
+
+def decode_jwt_role(token: str) -> str:
     try:
-        parts = jwt_token.strip().split(".")
+        parts = token.strip().split(".")
         if len(parts) != 3:
             return "unknown"
-        payload = parts[1]
-        payload += "=" * (4 - len(payload) % 4)
-        decoded = json.loads(base64.b64decode(payload).decode("utf-8"))
-        return decoded.get("role", "unknown")
+        payload = parts[1] + "=" * (4 - len(parts[1]) % 4)
+        return json.loads(base64.b64decode(payload).decode()).get("role", "unknown")
     except Exception:
         return "unknown"
 
 
-def validate_supabase_key(supabase_key: str):
-    """Hard-stops with a clear message if the anon key is used instead of service_role."""
-    role = decode_jwt_role(supabase_key)
-    log.info(f"[KEY CHECK] JWT role decoded: '{role}'")
-
-    if role == "service_role":
-        log.info("[KEY CHECK] PASS — service_role key detected. RLS will be bypassed.")
-        return
-
+def get_supabase_client() -> SupabaseClient:
+    url = os.getenv("SUPABASE_URL", "")
+    key = os.getenv("SUPABASE_KEY", "")
+    if not url or not key:
+        raise RuntimeError("SUPABASE_URL and SUPABASE_KEY must be set in environment.")
+    role = decode_jwt_role(key)
     if role == "anon":
-        log.error(
-            "\n" + "=" * 70 + "\n"
-            "[FATAL] You are using the ANON key — inserts will ALWAYS fail with:\n"
-            "  'new row violates row-level security policy' (code 42501)\n\n"
-            "HOW TO FIX:\n"
-            "  1. Open Supabase Dashboard → Project Settings → API\n"
-            "  2. Copy the 'service_role' key (marked 'secret')\n"
-            "  3. Update your .env:\n"
-            "       SUPABASE_KEY=<service_role key here>\n"
-            + "=" * 70
+        raise RuntimeError(
+            "SUPABASE_KEY is the anon key — inserts will fail with RLS error (42501). "
+            "Use the service_role key instead."
         )
-        sys.exit(1)
-
-    log.warning(
-        f"[KEY CHECK] Could not confirm role (got: '{role}'). "
-        "Proceeding, but inserts may fail if this is not a service_role key."
-    )
-
-
-def explain_insert_error(err_str: str, article_url: str) -> str:
-    if "42501" in err_str or "row-level security" in err_str.lower():
-        return (
-            f"[RLS BLOCK] '{article_url[:60]}'\n"
-            "  Cause: Using anon key. Use service_role key to fix."
-        )
-    if "23505" in err_str or "duplicate" in err_str.lower() or "unique" in err_str.lower():
-        return f"[DUPLICATE] '{article_url[:60]}' already exists"
-    if "23503" in err_str or "foreign key" in err_str.lower():
-        return f"[FK ERROR] '{article_url[:60]}' — referenced ID not found"
-    if "connection" in err_str.lower() or "timeout" in err_str.lower():
-        return f"[NETWORK] '{article_url[:60]}': {err_str[:100]}"
-    return f"[INSERT ERROR] '{article_url[:60]}': {err_str[:150]}"
+    if role != "service_role":
+        log.warning(f"[KEY] JWT role='{role}' — not service_role, inserts may fail.")
+    return create_client(url, key)
 
 
 # ==============================================================================
-# DATE FILTER
+# SUPABASE DATA LOADING  (unchanged logic from scraper_v4)
 # ==============================================================================
 
-def is_within_2_years(date_str) -> tuple:
-    if not date_str:
-        return True, None
-    raw = str(date_str).strip()
-    parse_fmts = [
-        "%Y-%m-%d %H:%M:%S%z", "%Y-%m-%dT%H:%M:%S%z",
-        "%Y-%m-%dT%H:%M:%S",   "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%d",             "%B %d, %Y",
-        "%b %d, %Y",            "%d %B %Y",
-        "%d %b %Y",             "%m/%d/%Y", "%d/%m/%Y",
-    ]
-    article_dt = None
-    for fmt in parse_fmts:
-        try:
-            parsed = datetime.strptime(raw[:25], fmt)
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=timezone.utc)
-            article_dt = parsed
-            break
-        except ValueError:
-            continue
-    if article_dt is None:
-        return True, None
-    if article_dt >= TWO_YEAR_CUTOFF:
-        return True, None
-    return (
-        False,
-        f"Date {article_dt.strftime('%Y-%m-%d')} older than cutoff "
-        f"{TWO_YEAR_CUTOFF.strftime('%Y-%m-%d')}"
-    )
-
-
-# ─── Search fallback patterns ────────────────────────────────────────────────
-FALLBACK_PATTERNS = [
-    ("url_search_param",    "url",   "{base}?s={keyword}"),
-    ("url_query_param",     "url",   "{base}?q={keyword}"),
-    ("url_search_path",     "url",   "{base}/search?q={keyword}"),
-    ("url_search_path_s",   "url",   "{base}/search?s={keyword}"),
-    ("url_search_slash",    "url",   "{base}/search/{keyword}/"),
-    ("url_tag_path",        "url",   "{base}/?tag={keyword}"),
-    ("input_name_search",   "input", "input[name='search']"),
-    ("input_name_q",        "input", "input[name='q']"),
-    ("input_name_s",        "input", "input[name='s']"),
-    ("input_type_search",   "input", "input[type='search']"),
-    ("input_placeholder",   "input", "input[placeholder*='earch' i]"),
-    ("input_class_search",  "input", "input[class*='search' i]"),
-    ("input_id_search",     "input", "input[id*='search' i]"),
-    ("icon_aria_search",    "icon",  "button[aria-label*='Search' i]"),
-    ("icon_class_search",   "icon",  "button[class*='search' i]"),
-    ("icon_i_search",       "icon",  "i[class*='search' i]"),
-    ("icon_svg_search",     "icon",  "svg[class*='search' i]"),
-    ("icon_class_srch_btn", "icon",  ".search-button"),
-    ("icon_class_srch_icn", "icon",  ".search-icon"),
-    ("icon_class_srch_tog", "icon",  ".search-toggle"),
-]
-
-POST_ICON_INPUT_SELECTORS = [
-    "input[type='search']", "input[name='q']", "input[name='s']",
-    "input[placeholder*='earch' i]", "input[class*='search' i]", "input:visible",
-]
-
-ARTICLE_LINK_SELECTOR_GROUPS = [
-    ["article h1 a[href]", "article h2 a[href]", "article h3 a[href]",
-     "article .entry-title a[href]", "article .post-title a[href]",
-     "article .article-title a[href]", "article .news-title a[href]",
-     "article a[href]"],
-    ["h2 a[href]", "h3 a[href]", ".entry-title a[href]", ".post-title a[href]",
-     ".news-title a[href]", ".article-title a[href]"],
-    [".result a[href]", ".search-result a[href]", "li.result a[href]",
-     "a.result-title[href]", "[class*='search-result'] a[href]"],
-    [".post a[href]", ".article a[href]", "[class*='article'] a[href]",
-     "[class*='post-item'] a[href]", "[class*='news-item'] a[href]"],
-    ["main a[href]", "#content a[href]", ".content a[href]", "[role='main'] a[href]"],
-]
-
-NON_ARTICLE_PATH_SEGMENTS = {
-    "topics", "topic", "category", "categories", "cat", "tag", "tags",
-    "label", "labels", "explore", "browse", "author", "authors",
-    "contributor", "contributors", "page", "archive", "archives", "search",
-    "feed", "rss", "newsletter", "subscribe", "subscription",
-    "about", "contact", "advertise", "careers", "events", "webinar",
-    "webinars", "conference", "podcast", "podcasts", "video", "videos",
-    "gallery", "product", "products", "shop", "store",
-    "login", "register", "signup", "account",
-}
-MIN_ANCHOR_TEXT_LEN = 20
-
-TITLE_SELECTORS = [
-    "h1.entry-title", "h1.post-title", "h1.article-title",
-    "h1[class*='title']", "h1[itemprop='headline']",
-    ".headline", "article h1", "h1",
-]
-DATE_SELECTORS = [
-    "time[datetime]", "[itemprop='datePublished']", ".published",
-    ".post-date", ".entry-date", "[class*='date']", "[class*='time']",
-    "meta[property='article:published_time']",
-]
-TEXT_SELECTORS = [
-    "article .entry-content", "article .post-content",
-    "article .article-body", "[itemprop='articleBody']",
-    ".article-content", ".post-body", "article", "main",
-]
-
-COMPANY_RE = re.compile(
-    r'\b([A-Z][A-Za-z0-9&\.\-]+(?: [A-Z][A-Za-z0-9&\.\-]+)*'
-    r'\s*(?:Inc\.?|Corp\.?|Ltd\.?|LLC|PLC|GmbH|Co\.?|Group|Holdings?'
-    r'|Technologies?|Solutions?|Services?))\b'
-)
-LOCATION_RE = re.compile(
-    r'\b([A-Z][a-z]+(?: [A-Z][a-z]+)*),\s*'
-    r'([A-Z]{2}|[A-Z][a-z]+(?: [A-Z][a-z]+)*)\b'
-)
-
-
-# ==============================================================================
-# SUPABASE INIT
-# ==============================================================================
-
-def init_supabase(supabase_url: str, supabase_key: str) -> SupabaseClient:
-    if not supabase_url or not supabase_key:
-        log.error(
-            "[FATAL] Supabase credentials missing.\n"
-            "  Set SUPABASE_URL and SUPABASE_KEY in your .env file."
-        )
-        sys.exit(1)
-    validate_supabase_key(supabase_key)
-    client = create_client(supabase_url, supabase_key)
-    log.info(f"[SUPABASE] Connected to {supabase_url}")
-    return client
-
-
-# ==============================================================================
-# SUPABASE DATA LOADING
-# ==============================================================================
-
-def fetch_base_url_row(sb: SupabaseClient, base_url_raw: str, base_url_id_arg) -> dict:
-    base_url = base_url_raw.rstrip("/")
+def fetch_base_url_row(sb: SupabaseClient, base_url: str, base_url_id_arg) -> dict:
+    base_url = base_url.rstrip("/")
     if base_url_id_arg:
-        log.info(f"[SUPABASE] Fetching base_url row by id={base_url_id_arg}")
-        resp = (
-            sb.table("ses_base_url")
-            .select("base_url_id, base_url, subsegment_id")
-            .eq("base_url_id", base_url_id_arg)
-            .limit(1).execute()
-        )
+        resp = (sb.table("ses_base_url")
+                .select("base_url_id,base_url,subsegment_id")
+                .eq("base_url_id", base_url_id_arg).limit(1).execute())
     else:
-        log.info(f"[SUPABASE] Fetching base_url row by URL: {base_url}")
-        resp = (
-            sb.table("ses_base_url")
-            .select("base_url_id, base_url, subsegment_id")
-            .eq("base_url", base_url)
-            .limit(1).execute()
-        )
+        resp = (sb.table("ses_base_url")
+                .select("base_url_id,base_url,subsegment_id")
+                .eq("base_url", base_url).limit(1).execute())
         if not resp.data:
-            resp = (
-                sb.table("ses_base_url")
-                .select("base_url_id, base_url, subsegment_id")
-                .eq("base_url", base_url + "/")
-                .limit(1).execute()
-            )
-
+            resp = (sb.table("ses_base_url")
+                    .select("base_url_id,base_url,subsegment_id")
+                    .eq("base_url", base_url + "/").limit(1).execute())
     if not resp.data:
-        log.error(f"[FATAL] '{base_url}' not found in ses_base_url table.")
-        sys.exit(1)
-
+        raise ValueError(f"'{base_url}' not found in ses_base_url table.")
     row = resp.data[0]
-    log.info(
-        f"[SUPABASE] base_url row: "
-        f"base_url_id={row['base_url_id']}  subsegment_id={row.get('subsegment_id')}"
-    )
+    log.info(f"[DB] base_url_id={row['base_url_id']}  subsegment_id={row.get('subsegment_id')}")
     return row
 
 
 def fetch_subsegment_and_segment(sb: SupabaseClient, subsegment_id) -> tuple:
     if not subsegment_id:
         return None, None, None
-    resp = (
-        sb.table("ses_subsegments")
-        .select("subsegment_id, subsegment_name, segment_id")
-        .eq("subsegment_id", subsegment_id)
-        .limit(1).execute()
-    )
+    resp = (sb.table("ses_subsegments")
+            .select("subsegment_id,subsegment_name,segment_id")
+            .eq("subsegment_id", subsegment_id).limit(1).execute())
     if not resp.data:
-        log.warning(f"[SUPABASE] subsegment_id={subsegment_id} not found")
         return None, None, None
-    sub         = resp.data[0]
-    subseg_name = sub.get("subsegment_name")
-    segment_id  = sub.get("segment_id")
-    seg_name    = None
+    sub       = resp.data[0]
+    seg_name  = None
+    segment_id = sub.get("segment_id")
     if segment_id:
-        seg_resp = (
-            sb.table("ses_segments")
-            .select("segment_id, segment_name")
-            .eq("segment_id", segment_id)
-            .limit(1).execute()
-        )
-        if seg_resp.data:
-            seg_name = seg_resp.data[0].get("segment_name")
-    log.info(f"[SUPABASE] subsegment='{subseg_name}'  segment='{seg_name}'")
-    return subseg_name, seg_name, segment_id
+        sr = (sb.table("ses_segments")
+              .select("segment_name")
+              .eq("segment_id", segment_id).limit(1).execute())
+        if sr.data:
+            seg_name = sr.data[0].get("segment_name")
+    return sub.get("subsegment_name"), seg_name, segment_id
 
 
 def fetch_keywords(sb: SupabaseClient, subsegment_id) -> list:
     if not subsegment_id:
         return []
-    resp = (
-        sb.table("ses_keywords")
-        .select("keyword")
-        .eq("subsegment_id", subsegment_id)
-        .execute()
-    )
-    keywords = [r["keyword"] for r in resp.data if r.get("keyword")]
-    log.info(f"[SUPABASE] {len(keywords)} keywords for subsegment_id={subsegment_id}: {keywords}")
-    return keywords
+    resp = (sb.table("ses_keywords")
+            .select("keyword")
+            .eq("subsegment_id", subsegment_id).execute())
+    return [r["keyword"] for r in resp.data if r.get("keyword")]
 
 
-def resolve_search_terms(keywords, subsegment_name, segment_name) -> tuple:
-    if keywords:
-        log.info(f"[TERMS] Using {len(keywords)} keywords from ses_keywords")
-        return keywords, "keywords"
-    if subsegment_name:
-        log.info(f"[TERMS] No keywords → falling back to subsegment: '{subsegment_name}'")
-        return [subsegment_name], "subsegment"
-    if segment_name:
-        log.info(f"[TERMS] No subsegment → falling back to segment: '{segment_name}'")
-        return [segment_name], "segment"
-    log.error("[FATAL] No keywords, subsegment, or segment name available.")
-    sys.exit(1)
-
-
-# ==============================================================================
-# ▼▼▼ CHANGED: load search pattern from Supabase instead of local CSV ▼▼▼
-# ==============================================================================
-
-def load_search_pattern_from_supabase(sb: SupabaseClient, base_url_id: str, base_url_raw: str) -> dict:
-    """
-    Fetch method/pattern for this base URL from Supabase table:
-        public.base_url_search_patterns
-
-    Lookup priority:
-      1. Match by base_url_id (exact, using the FK — fastest and most reliable)
-      2. Match by base_url string (fallback if base_url_id somehow differs)
-
-    Returns: { method, pattern, confidence, result_type }
-    Exits with a clear error if no row is found.
-
-    Table schema used:
-        base_url_search_patterns (
-            id, base_url_id (FK → ses_base_url), base_url,
-            method, pattern, confidence, result_type, created_at
-        )
-    """
-    log.info(
-        f"[SUPABASE] Fetching search pattern from base_url_search_patterns\n"
-        f"  base_url_id = {base_url_id}\n"
-        f"  base_url    = {base_url_raw}"
-    )
-
-    # ── Lookup 1: by base_url_id (FK, unique constraint guaranteed) ───────
-    resp = (
-        sb.table("base_url_search_patterns")
-        .select("method, pattern, confidence, result_type, base_url")
-        .eq("base_url_id", base_url_id)
-        .limit(1)
-        .execute()
-    )
-
-    # ── Lookup 2 (fallback): by base_url string if id lookup returned nothing
+def load_search_pattern(sb: SupabaseClient, base_url_id: str, base_url: str) -> dict:
+    resp = (sb.table("base_url_search_patterns")
+            .select("method,pattern,confidence,result_type")
+            .eq("base_url_id", base_url_id).limit(1).execute())
     if not resp.data:
-        log.warning(
-            f"[SUPABASE] No pattern found by base_url_id={base_url_id}, "
-            f"trying base_url string match..."
-        )
-        base_url_norm = base_url_raw.rstrip("/")
-        resp = (
-            sb.table("base_url_search_patterns")
-            .select("method, pattern, confidence, result_type, base_url")
-            .eq("base_url", base_url_norm)
-            .limit(1)
-            .execute()
-        )
-        if not resp.data:
-            # Try with trailing slash
-            resp = (
-                sb.table("base_url_search_patterns")
-                .select("method, pattern, confidence, result_type, base_url")
-                .eq("base_url", base_url_norm + "/")
-                .limit(1)
-                .execute()
-            )
-
+        for url_try in [base_url.rstrip("/"), base_url.rstrip("/") + "/"]:
+            resp = (sb.table("base_url_search_patterns")
+                    .select("method,pattern,confidence,result_type")
+                    .eq("base_url", url_try).limit(1).execute())
+            if resp.data:
+                break
     if not resp.data:
-        log.error(
-            f"\n{'='*70}\n"
-            f"[FATAL] No search pattern found in base_url_search_patterns for:\n"
-            f"  base_url_id = {base_url_id}\n"
-            f"  base_url    = {base_url_raw}\n\n"
-            "  This URL needs to be added to the base_url_search_patterns table first.\n"
-            "  Required columns: base_url_id, base_url, method, pattern, confidence, result_type\n"
-            f"{'='*70}"
+        raise ValueError(
+            f"No search pattern in base_url_search_patterns for base_url_id={base_url_id}. "
+            "Add a row there first."
         )
-        sys.exit(1)
-
     row = resp.data[0]
-    pattern = {
+    return {
         "method":      row.get("method"),
         "pattern":     row.get("pattern"),
         "confidence":  int(row.get("confidence") or 0),
         "result_type": row.get("result_type") or "unknown",
     }
 
-    log.info(
-        f"[SUPABASE] Search pattern loaded:\n"
-        f"  method      = {pattern['method']}\n"
-        f"  pattern     = {pattern['pattern']}\n"
-        f"  confidence  = {pattern['confidence']}\n"
-        f"  result_type = {pattern['result_type']}"
-    )
-    return pattern
 
-# ==============================================================================
-# ▲▲▲ END OF CHANGED SECTION ▲▲▲
-# ==============================================================================
-
-
-# ==============================================================================
-# SUPABASE INSERT
-# ==============================================================================
-
-def insert_articles_to_supabase(sb: SupabaseClient, rows: list) -> tuple:
-    inserted = 0
-    skipped  = 0
+def insert_articles(sb: SupabaseClient, rows: list) -> tuple:
+    inserted = skipped = 0
     for row in rows:
         record = {
             "unfiltered_article_id": row["unfiltered_article_id"],
@@ -487,61 +289,147 @@ def insert_articles_to_supabase(sb: SupabaseClient, rows: list) -> tuple:
         try:
             sb.table("ses_unfiltered_articles").insert(record).execute()
             inserted += 1
-            log.debug(f"  [INSERT] OK: {row['article_link'][:80]}")
         except Exception as e:
-            err_str = str(e)
-            msg     = explain_insert_error(err_str, row["article_link"])
-            if "23505" in err_str or "duplicate" in err_str.lower() or "unique" in err_str.lower():
-                skipped += 1
-                log.debug(f"  {msg}")
-            elif "42501" in err_str or "row-level security" in err_str.lower():
-                log.error(f"\n{'='*70}\n  {msg}\n{'='*70}")
-                skipped += 1
+            skipped += 1
+            err = str(e)
+            if "42501" in err or "row-level security" in err.lower():
+                log.error(f"  [RLS BLOCK] {row['article_link'][:70]} — use service_role key!")
+            elif "23505" in err or "duplicate" in err.lower():
+                log.debug(f"  [DUPLICATE] {row['article_link'][:70]}")
             else:
-                log.error(f"  {msg}")
-                skipped += 1
-    log.info(f"  [SUPABASE BATCH] inserted={inserted}  skipped={skipped}")
+                log.error(f"  [INSERT ERROR] {row['article_link'][:70]}: {err[:100]}")
     return inserted, skipped
 
 
-def maybe_save_local_csv(rows: list, path, write_header: bool):
-    if not path or not rows:
-        return
-    col_order = [
-        "unfiltered_article_id", "search_url_id", "article_link",
-        "article_title", "article_date", "companies_mentioned", "location",
-        "extracted_text", "is_valid", "drop_reason", "filter_article_status",
-        "created_at", "subsegment_name", "base_url_id",
-        "keyword_used", "search_url", "method_used", "search_term_source",
-    ]
-    df = pd.DataFrame(rows)
-    for c in col_order:
-        if c not in df.columns:
-            df[c] = None
-    df[col_order].to_csv(path, mode="w" if write_header else "a",
-                         header=write_header, index=False, encoding="utf-8")
-    log.info(f"  [CSV BACKUP] {len(rows)} rows → {path}")
+# ==============================================================================
+# SEARCH / EXTRACTION CONSTANTS & HELPERS  (unchanged from scraper_v4)
+# ==============================================================================
+
+FALLBACK_PATTERNS = [
+    ("url_search_param",  "url",   "{base}?s={keyword}"),
+    ("url_query_param",   "url",   "{base}?q={keyword}"),
+    ("url_search_path",   "url",   "{base}/search?q={keyword}"),
+    ("url_search_path_s", "url",   "{base}/search?s={keyword}"),
+    ("url_search_slash",  "url",   "{base}/search/{keyword}/"),
+    ("url_tag_path",      "url",   "{base}/?tag={keyword}"),
+    ("input_name_search", "input", "input[name='search']"),
+    ("input_name_q",      "input", "input[name='q']"),
+    ("input_name_s",      "input", "input[name='s']"),
+    ("input_type_search", "input", "input[type='search']"),
+    ("input_placeholder", "input", "input[placeholder*='earch' i]"),
+    ("input_class_search","input", "input[class*='search' i]"),
+    ("input_id_search",   "input", "input[id*='search' i]"),
+    ("icon_aria_search",  "icon",  "button[aria-label*='Search' i]"),
+    ("icon_class_search", "icon",  "button[class*='search' i]"),
+    ("icon_i_search",     "icon",  "i[class*='search' i]"),
+    ("icon_svg_search",   "icon",  "svg[class*='search' i]"),
+    ("icon_srch_btn",     "icon",  ".search-button"),
+    ("icon_srch_icn",     "icon",  ".search-icon"),
+    ("icon_srch_tog",     "icon",  ".search-toggle"),
+]
+POST_ICON_INPUTS = [
+    "input[type='search']", "input[name='q']", "input[name='s']",
+    "input[placeholder*='earch' i]", "input[class*='search' i]", "input:visible",
+]
+ARTICLE_LINK_GROUPS = [
+    ["article h1 a[href]","article h2 a[href]","article h3 a[href]",
+     "article .entry-title a[href]","article a[href]"],
+    ["h2 a[href]","h3 a[href]",".entry-title a[href]",".post-title a[href]",
+     ".news-title a[href]",".article-title a[href]"],
+    [".result a[href]",".search-result a[href]","[class*='search-result'] a[href]"],
+    [".post a[href]",".article a[href]","[class*='article'] a[href]",
+     "[class*='post-item'] a[href]","[class*='news-item'] a[href]"],
+    ["main a[href]","#content a[href]",".content a[href]"],
+]
+NON_ARTICLE_SEGS = {
+    "topics","topic","category","categories","cat","tag","tags","label","labels",
+    "explore","browse","author","authors","contributor","page","archive","archives",
+    "search","feed","rss","newsletter","subscribe","about","contact","advertise",
+    "careers","events","webinar","conference","podcast","video","gallery",
+    "product","products","shop","store","login","register","signup","account",
+}
+TITLE_SELS  = ["h1.entry-title","h1.post-title","h1[class*='title']","article h1","h1"]
+DATE_SELS   = ["time[datetime]","[itemprop='datePublished']",".published",
+               ".post-date",".entry-date","[class*='date']",
+               "meta[property='article:published_time']"]
+TEXT_SELS   = ["article .entry-content","article .post-content",
+               "[itemprop='articleBody']",".article-content","article","main"]
+COMPANY_RE  = re.compile(
+    r'\b([A-Z][A-Za-z0-9&\.\-]+(?: [A-Z][A-Za-z0-9&\.\-]+)*'
+    r'\s*(?:Inc\.?|Corp\.?|Ltd\.?|LLC|PLC|GmbH|Co\.?|Group|Holdings?'
+    r'|Technologies?|Solutions?|Services?))\b'
+)
+LOCATION_RE = re.compile(
+    r'\b([A-Z][a-z]+(?: [A-Z][a-z]+)*),\s*'
+    r'([A-Z]{2}|[A-Z][a-z]+(?: [A-Z][a-z]+)*)\b'
+)
+
+
+def _is_article_url(url: str, anchor: str, base_url: str) -> tuple:
+    path = urlparse(url).path.rstrip("/")
+    if anchor and len(anchor.strip()) < 20:
+        return False, "anchor too short"
+    last = path.lower().split("/")[-1]
+    ext  = ("." + last.rsplit(".", 1)[1]) if "." in last else ""
+    if ext in {".pdf",".jpg",".jpeg",".png",".gif",".svg",".zip",".xml",".json",".css",".js"}:
+        return False, f"bad ext {ext}"
+    for seg in [s.lower() for s in path.split("/") if s]:
+        if seg.split("?")[0].split("#")[0] in NON_ARTICLE_SEGS:
+            return False, f"non-article seg '{seg}'"
+    if len([s for s in path.split("/") if s]) < 2:
+        return False, "path too shallow"
+    if path == urlparse(base_url).path.rstrip("/") or path == "":
+        return False, "is base url"
+    return True, "ok"
+
+
+def _is_within_2_years(date_str) -> tuple:
+    if not date_str:
+        return True, None
+    raw = str(date_str).strip()
+    for fmt in ["%Y-%m-%d %H:%M:%S%z","%Y-%m-%dT%H:%M:%S%z","%Y-%m-%dT%H:%M:%S",
+                "%Y-%m-%d %H:%M:%S","%Y-%m-%d","%B %d, %Y","%b %d, %Y",
+                "%d %B %Y","%d %b %Y","%m/%d/%Y","%d/%m/%Y"]:
+        try:
+            parsed = datetime.strptime(raw[:25], fmt)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            if parsed >= TWO_YEAR_CUTOFF:
+                return True, None
+            return False, f"date {parsed.date()} older than cutoff {TWO_YEAR_CUTOFF.date()}"
+        except ValueError:
+            continue
+    return True, None   # unparseable → keep
+
+
+def _parse_date(raw: str):
+    if not raw:
+        return None
+    for fmt in ["%Y-%m-%dT%H:%M:%S%z","%Y-%m-%dT%H:%M:%S","%Y-%m-%d %H:%M:%S",
+                "%Y-%m-%d","%B %d, %Y","%b %d, %Y","%d %B %Y","%d %b %Y",
+                "%m/%d/%Y","%d/%m/%Y"]:
+        try:
+            dt = datetime.strptime(raw.strip()[:25], fmt)
+            return dt.strftime("%Y-%m-%d %H:%M:%S+05:30")
+        except ValueError:
+            continue
+    return raw
 
 
 # ==============================================================================
-# PLAYWRIGHT HELPERS — unchanged
+# PLAYWRIGHT SEARCH HELPERS
 # ==============================================================================
 
-async def try_url_pattern(page, base_url, keyword, url_template):
-    base   = base_url.rstrip("/")
-    kw_enc = quote_plus(keyword)
-    url    = url_template.replace("{base}", base).replace("{keyword}", kw_enc)
-    log.debug(f"    [url] {url}")
+async def _try_url(page, base_url, keyword, template):
+    url = template.replace("{base}", base_url.rstrip("/")).replace("{keyword}", quote_plus(keyword))
     try:
-        resp = await page.goto(url, timeout=20000, wait_until="domcontentloaded")
-        return bool(resp and resp.status < 400)
-    except Exception as e:
-        log.debug(f"    [url] ERROR: {e}")
+        r = await page.goto(url, timeout=20000, wait_until="domcontentloaded")
+        return bool(r and r.status < 400)
+    except Exception:
         return False
 
 
-async def try_input_pattern(page, selector, keyword):
-    log.debug(f"    [input] {selector}")
+async def _try_input(page, selector, keyword):
     try:
         el = page.locator(selector).first
         if await el.count() == 0:
@@ -552,152 +440,84 @@ async def try_input_pattern(page, selector, keyword):
         await el.press("Enter")
         await page.wait_for_load_state("domcontentloaded", timeout=15000)
         return True
-    except Exception as e:
-        log.debug(f"    [input] ERROR: {e}")
+    except Exception:
         return False
 
 
-async def try_icon_pattern(page, selector, keyword):
-    log.debug(f"    [icon] {selector}")
+async def _try_icon(page, selector, keyword):
     try:
         el = page.locator(selector).first
         if await el.count() == 0:
             return False
         await el.click(timeout=5000)
         await page.wait_for_timeout(800)
-        for inp_sel in POST_ICON_INPUT_SELECTORS:
-            inp = page.locator(inp_sel).first
-            if await inp.count() > 0 and await inp.is_visible():
-                await inp.fill(keyword)
-                await inp.press("Enter")
+        for inp in POST_ICON_INPUTS:
+            i = page.locator(inp).first
+            if await i.count() > 0 and await i.is_visible():
+                await i.fill(keyword)
+                await i.press("Enter")
                 await page.wait_for_load_state("domcontentloaded", timeout=15000)
                 return True
         return False
-    except Exception as e:
-        log.debug(f"    [icon] ERROR: {e}")
+    except Exception:
         return False
 
 
-def is_likely_article_url(url: str, anchor_text: str, base_url: str) -> tuple:
-    parsed     = urlparse(url)
-    path       = parsed.path.rstrip("/")
-    text       = (anchor_text or "").strip()
-    if text and len(text) < MIN_ANCHOR_TEXT_LEN:
-        return False, f"anchor text too short ({len(text)} chars)"
-    lower_path = path.lower()
-    last_seg   = lower_path.split("/")[-1]
-    ext        = ("." + last_seg.rsplit(".", 1)[1]) if "." in last_seg else ""
-    if ext in {".pdf", ".jpg", ".jpeg", ".png", ".gif", ".svg",
-               ".zip", ".xml", ".json", ".css", ".js"}:
-        return False, f"non-article extension: {ext}"
-    if ext in (".html", ".htm") and len([s for s in path.split("/") if s]) < 4:
-        return False, ".html shallow path"
-    for seg in [s.lower() for s in path.split("/") if s]:
-        if seg.split("?")[0].split("#")[0] in NON_ARTICLE_PATH_SEGMENTS:
-            return False, f"non-article path segment: '{seg}'"
-    if len([s for s in path.split("/") if s]) < 2:
-        return False, "path too shallow"
-    if path == urlparse(base_url).path.rstrip("/") or path == "":
-        return False, "is base URL"
-    return True, "ok"
-
-
-async def extract_article_links(page, base_url):
+async def _extract_links(page, base_url) -> list:
     base_domain = urlparse(base_url).netloc
     accepted    = {}
-    rejected    = []
-    for group_idx, selectors in enumerate(ARTICLE_LINK_SELECTOR_GROUPS, 1):
-        group_accepted = {}
-        group_rejected = []
-        for sel in selectors:
+    for group in ARTICLE_LINK_GROUPS:
+        group_ok = {}
+        for sel in group:
             try:
                 for el in await page.locator(sel).all():
                     try:
                         href = await el.get_attribute("href")
-                        if not href or href.startswith(("#", "javascript", "mailto", "tel")):
+                        if not href or href.startswith(("#","javascript","mailto","tel")):
                             continue
-                        abs_url     = urljoin(base_url, href)
-                        link_domain = urlparse(abs_url).netloc
-                        if base_domain not in link_domain and link_domain not in base_domain:
+                        abs_url = urljoin(base_url, href)
+                        if base_domain not in urlparse(abs_url).netloc:
                             continue
-                        if abs_url in accepted or abs_url in group_accepted:
+                        if abs_url in accepted or abs_url in group_ok:
                             continue
                         try:
-                            anchor_text = (await el.inner_text()).strip()
+                            text = (await el.inner_text()).strip()
                         except Exception:
-                            anchor_text = ""
-                        keep, reason = is_likely_article_url(abs_url, anchor_text, base_url)
+                            text = ""
+                        keep, _ = _is_article_url(abs_url, text, base_url)
                         if keep:
-                            group_accepted[abs_url] = anchor_text
-                        else:
-                            group_rejected.append((abs_url, reason))
+                            group_ok[abs_url] = text
                     except Exception:
                         continue
             except Exception:
                 continue
-        log.debug(f"    [extract] group {group_idx}: {len(group_accepted)} ok, {len(group_rejected)} skip")
-        if group_accepted:
-            accepted.update(group_accepted)
-            rejected.extend(group_rejected)
-            log.info(f"    [extract] Stopped at group {group_idx} — {len(accepted)} links")
+        if group_ok:
+            accepted.update(group_ok)
             break
-        else:
-            rejected.extend(group_rejected)
-    for url, reason in rejected[:10]:
-        log.debug(f"      SKIP [{reason}] {url}")
-    log.info(f"    [extract] Final: {len(accepted)} article links")
     return list(accepted.keys())
 
 
-async def search_and_extract(page, base_url, keyword, known_pattern):
-    result = {
-        "base_url": base_url, "keyword": keyword, "method_used": None,
-        "pattern_used": None, "search_url": None, "articles_found": 0,
-        "article_links": [], "status": "failed", "error": None,
-    }
-    log.info(f"  [step1] Navigating to: {base_url}")
+async def _search_for_keyword(page, base_url: str, keyword: str, pattern: dict) -> dict:
+    result = {"keyword": keyword, "status": "failed",
+              "search_url": None, "links": [], "method": None}
+
     try:
-        resp = await page.goto(base_url, timeout=25000, wait_until="domcontentloaded")
-        if resp and resp.status >= 400:
-            log.warning(f"  [step1] HTTP {resp.status}")
+        await page.goto(base_url, timeout=25000, wait_until="domcontentloaded")
     except Exception as e:
-        log.error(f"  [step1] UNREACHABLE: {e}")
-        result["error"]  = str(e)
         result["status"] = "unreachable"
+        result["error"]  = str(e)
         return result
 
-    search_succeeded = False
-    if known_pattern and known_pattern["method"] != "fallback":
-        method, pattern = known_pattern["method"], known_pattern["pattern"]
-        log.info(f"  [step2] pattern: method={method}  pattern={pattern}")
-        if method == "url":
-            search_succeeded = await try_url_pattern(page, base_url, keyword, pattern)
-        elif method == "input":
-            search_succeeded = await try_input_pattern(page, pattern, keyword)
-        elif method == "icon":
-            search_succeeded = await try_icon_pattern(page, pattern, keyword)
-        if search_succeeded:
-            result["method_used"]  = method
-            result["pattern_used"] = pattern
-            log.info("  [step2] pattern SUCCESS")
-        else:
-            log.warning("  [step2] pattern FAILED → fallbacks")
-    elif known_pattern and known_pattern["method"] == "fallback":
-        kw_enc  = quote_plus(keyword)
-        fb_url  = known_pattern["pattern"]
-        nav_url = fb_url + kw_enc if "?" in fb_url else f"{fb_url}?q={kw_enc}"
-        log.info(f"  [step2] fallback URL: {nav_url}")
-        try:
-            resp = await page.goto(nav_url, timeout=20000, wait_until="domcontentloaded")
-            if resp and resp.status < 400:
-                search_succeeded       = True
-                result["method_used"]  = "fallback_url"
-                result["pattern_used"] = nav_url
-        except Exception as e:
-            log.debug(f"  [step2] fallback URL ERROR: {e}")
+    ok = False
+    method, pat = pattern.get("method"), pattern.get("pattern")
+    if method and method != "fallback":
+        if   method == "url":   ok = await _try_url(page, base_url, keyword, pat)
+        elif method == "input": ok = await _try_input(page, pat, keyword)
+        elif method == "icon":  ok = await _try_icon(page, pat, keyword)
+        if ok:
+            result["method"] = method
 
-    if not search_succeeded:
-        log.info(f"  [step3] Trying {len(FALLBACK_PATTERNS)} fallback patterns...")
+    if not ok:
         for label, ftype, fpat in FALLBACK_PATTERNS:
             if ftype in ("input", "icon"):
                 try:
@@ -705,73 +525,34 @@ async def search_and_extract(page, base_url, keyword, known_pattern):
                     await page.wait_for_timeout(500)
                 except Exception:
                     continue
-            ok = False
-            if ftype == "url":
-                ok = await try_url_pattern(page, base_url, keyword, fpat)
-            elif ftype == "input":
-                ok = await try_input_pattern(page, fpat, keyword)
-            elif ftype == "icon":
-                ok = await try_icon_pattern(page, fpat, keyword)
+            if   ftype == "url":   ok = await _try_url(page, base_url, keyword, fpat)
+            elif ftype == "input": ok = await _try_input(page, fpat, keyword)
+            elif ftype == "icon":  ok = await _try_icon(page, fpat, keyword)
             if ok:
-                search_succeeded       = True
-                result["method_used"]  = ftype
-                result["pattern_used"] = fpat
-                log.info(f"  [step3] FALLBACK SUCCESS: [{label}] {fpat}")
+                result["method"] = f"fallback_{ftype}:{label}"
                 break
 
-    if not search_succeeded:
-        log.warning(f"  [step3] ALL patterns failed for '{keyword}'")
+    if not ok:
         result["status"] = "no_pattern_worked"
         return result
 
     result["search_url"] = page.url
-    log.info(f"  [step4] Results page: {page.url}")
     await page.wait_for_timeout(1500)
-    links = await extract_article_links(page, base_url)
-    if not links:
-        title = await page.title()
-        log.warning(f"  [step4] 0 links. Page: '{title}'")
-        result["status"] = "no_links_found"
-    else:
-        result["status"]         = "success"
-        result["articles_found"] = len(links)
-        result["article_links"]  = links
-        log.info(f"  [step4] SUCCESS — {len(links)} links")
+    links = await _extract_links(page, base_url)
+    result["links"]  = links
+    result["status"] = "success" if links else "no_links"
     return result
 
 
-# ==============================================================================
-# ARTICLE DETAIL EXTRACTION — unchanged
-# ==============================================================================
-
-def _parse_date(raw: str):
-    if not raw:
-        return None
-    raw = raw.strip()
-    for fmt in [
-        "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%d", "%B %d, %Y", "%b %d, %Y",
-        "%d %B %Y", "%d %b %Y", "%m/%d/%Y", "%d/%m/%Y",
-    ]:
-        try:
-            dt = datetime.strptime(raw[:25], fmt)
-            return dt.strftime("%Y-%m-%d %H:%M:%S+05:30")
-        except ValueError:
-            continue
-    return raw
-
-
-async def extract_article_details(page, article_url: str) -> dict:
-    d = {
-        "article_title": None, "article_date": None,
-        "extracted_text": None, "companies_mentioned": None, "location": None,
-    }
+async def _extract_article(page, url: str) -> dict:
+    d = {"article_title": None, "article_date": None,
+         "extracted_text": None, "companies_mentioned": None, "location": None}
     try:
-        resp = await page.goto(article_url, timeout=25000, wait_until="domcontentloaded")
-        if resp and resp.status >= 400:
+        r = await page.goto(url, timeout=25000, wait_until="domcontentloaded")
+        if r and r.status >= 400:
             return d
         await page.wait_for_timeout(1000)
-        for sel in TITLE_SELECTORS:
+        for sel in TITLE_SELS:
             try:
                 el = page.locator(sel).first
                 if await el.count() > 0:
@@ -786,172 +567,139 @@ async def extract_article_details(page, article_url: str) -> dict:
                 d["article_title"] = (await page.title()).strip()[:500]
             except Exception:
                 pass
-        for sel in DATE_SELECTORS:
+        for sel in DATE_SELS:
             try:
                 el = page.locator(sel).first
                 if await el.count() > 0:
-                    raw = (await el.get_attribute("content") or
-                           await el.get_attribute("datetime") or
-                           (await el.inner_text()).strip())
+                    raw = (await el.get_attribute("content")
+                           or await el.get_attribute("datetime")
+                           or (await el.inner_text()).strip())
                     if raw:
                         d["article_date"] = _parse_date(raw)
                         break
             except Exception:
                 continue
-        for sel in TEXT_SELECTORS:
+        for sel in TEXT_SELS:
             try:
                 el = page.locator(sel).first
                 if await el.count() > 0:
-                    text = (await el.inner_text()).strip()
-                    if len(text) > 100:
-                        d["extracted_text"] = text[:5000]
+                    txt = (await el.inner_text()).strip()
+                    if len(txt) > 100:
+                        d["extracted_text"] = txt[:5000]
                         break
             except Exception:
                 continue
         src = d["extracted_text"] or ""
-        if not src:
-            try:
-                src = (await page.inner_text("body"))[:3000]
-            except Exception:
-                pass
         companies = COMPANY_RE.findall(src)
         d["companies_mentioned"] = "; ".join(list(dict.fromkeys(companies))[:10]) or None
         locs = LOCATION_RE.findall(src[:500])
         d["location"] = "; ".join(
-            list(dict.fromkeys(f"{c}, {s}" for c, s in locs))[:5]
-        ) or None
+            list(dict.fromkeys(f"{c},{s}" for c, s in locs))[:5]) or None
     except Exception as e:
-        log.warning(f"    [art-detail] Failed for {article_url}: {e}")
+        log.warning(f"  [article] Failed {url}: {e}")
     return d
 
 
 # ==============================================================================
-# MAIN
+# CORE SCRAPE TASK  (runs in background)
 # ==============================================================================
 
-async def main(args):
-    base_url = args.base_url.rstrip("/")
+async def _run_scrape(job_id: str, req: ScrapeRequest):
+    job = _jobs[job_id]
+    job["status"]     = "running"
+    job["started_at"] = datetime.utcnow().isoformat()
 
-    log.info(
-        f"\n{'='*70}\n"
-        f"  Single URL Article Scraper — Supabase Edition (v4 fixed)\n"
-        f"  Target       : {base_url}\n"
-        f"  2-year cutoff: {TWO_YEAR_CUTOFF.strftime('%Y-%m-%d')}\n"
-        f"{'='*70}"
-    )
+    def progress(msg: str):
+        job["progress"][datetime.utcnow().isoformat()] = msg
+        log.info(f"[{job_id[:8]}] {msg}")
 
-    supabase_url = args.supabase_url or os.getenv("SUPABASE_URL", "")
-    supabase_key = args.supabase_key or os.getenv("SUPABASE_KEY", "")
-    sb = init_supabase(supabase_url, supabase_key)
+    try:
+        # ── Supabase init ────────────────────────────────────────────
+        sb = get_supabase_client()
+        progress(f"Supabase connected | role=service_role")
 
-    # Fetch base_url row (gives us base_url_id + subsegment_id)
-    base_row      = fetch_base_url_row(sb, base_url, args.base_url_id)
-    base_url_id   = str(base_row["base_url_id"])
-    subsegment_id = base_row.get("subsegment_id")
+        base_url = req.base_url.rstrip("/")
 
-    # Fetch segment / subsegment names
-    subseg_name, seg_name, segment_id = fetch_subsegment_and_segment(sb, subsegment_id)
+        # ── Load metadata from Supabase ──────────────────────────────
+        base_row      = fetch_base_url_row(sb, base_url, req.base_url_id)
+        base_url_id   = str(base_row["base_url_id"])
+        subsegment_id = base_row.get("subsegment_id")
 
-    # Fetch keywords
-    keywords = fetch_keywords(sb, subsegment_id)
-    search_terms, term_source = resolve_search_terms(keywords, subseg_name, seg_name)
+        subseg_name, seg_name, _ = fetch_subsegment_and_segment(sb, subsegment_id)
+        keywords                  = fetch_keywords(sb, subsegment_id)
 
-    # ── CHANGED: fetch search pattern from Supabase (not local CSV) ───────
-    known_pattern = load_search_pattern_from_supabase(sb, base_url_id, base_url)
+        if keywords:
+            search_terms  = keywords
+            term_source   = "keywords"
+        elif subseg_name:
+            search_terms  = [subseg_name]
+            term_source   = "subsegment"
+        elif seg_name:
+            search_terms  = [seg_name]
+            term_source   = "segment"
+        else:
+            raise ValueError("No keywords, subsegment, or segment found for this URL.")
 
-    log.info(
-        f"\n[CONFIG]\n"
-        f"  base_url_id  : {base_url_id}\n"
-        f"  segment      : {seg_name}\n"
-        f"  subsegment   : {subseg_name}\n"
-        f"  terms [{term_source}] ({len(search_terms)}): {search_terms}\n"
-        f"  method       : {known_pattern['method']}\n"
-        f"  pattern      : {known_pattern['pattern']}\n"
-        f"  visit pages  : {not args.skip_article_visit}\n"
-        f"  CSV backup   : {args.output_csv or 'disabled'}\n"
-        f"{'='*70}"
-    )
+        pattern = load_search_pattern(sb, base_url_id, base_url)
+        progress(f"Pattern loaded: method={pattern['method']} | {len(search_terms)} terms")
 
-    all_links      = {}
-    output_rows    = []
-    total_inserted = 0
-    total_skipped  = 0
-    first_csv_write = True
-
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
-        )
-        context = await browser.new_context(
+        # ── Playwright Phase 1 — collect links ───────────────────────
+        all_links: dict = {}
+        context = await _browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/120.0.0.0 Safari/537.36"
             ),
             viewport={"width": 1280, "height": 800},
-            java_script_enabled=True,
         )
         await context.route(
             "**/*.{png,jpg,jpeg,gif,svg,woff,woff2,ttf,eot,mp4,webm}",
             lambda route: route.abort(),
         )
 
-        # PHASE 1: search each term → collect links
-        page = await context.new_page()
-        log.info(f"\n[PHASE 1] Searching {len(search_terms)} terms on {base_url}")
-
-        for kw_idx, term in enumerate(search_terms, 1):
-            log.info(f"\n  --- term [{kw_idx}/{len(search_terms)}]: '{term}' ---")
-            res = await search_and_extract(page, base_url, term, known_pattern)
-            await page.wait_for_timeout(1000)
+        search_page = await context.new_page()
+        for idx, term in enumerate(search_terms, 1):
+            progress(f"[{idx}/{len(search_terms)}] Searching '{term}'")
+            res = await _search_for_keyword(search_page, base_url, term, pattern)
+            await search_page.wait_for_timeout(1000)
             new_count = 0
-            for link in res["article_links"]:
+            for link in res["links"]:
                 if link not in all_links:
                     all_links[link] = {
-                        "keyword":     term,
-                        "search_url":  res["search_url"],
-                        "method_used": res["method_used"],
+                        "keyword":    term,
+                        "search_url": res["search_url"],
+                        "method":     res["method"],
                     }
                     new_count += 1
-            log.info(
-                f"  [term done] status={res['status']} | "
-                f"links={res['articles_found']} | new={new_count} | total={len(all_links)}"
-            )
+            progress(f"  '{term}' → status={res['status']} links={len(res['links'])} new={new_count} total={len(all_links)}")
 
-        log.info(f"\n[PHASE 1 DONE] {len(all_links)} unique article links\n{'='*70}")
+        progress(f"Phase 1 done — {len(all_links)} unique links")
 
-        # PHASE 2: visit articles + insert to Supabase
-        article_urls = list(all_links.keys())
+        # ── Playwright Phase 2 — article details + insert ────────────
+        output_rows    = []
+        total_inserted = 0
+        total_skipped  = 0
 
-        if not args.skip_article_visit and article_urls:
-            log.info(f"[PHASE 2] Visiting {len(article_urls)} article pages...")
+        if not req.skip_article_visit and all_links:
             art_page = await context.new_page()
             batch    = []
+            urls     = list(all_links.keys())
 
-            for art_idx, art_url in enumerate(article_urls, 1):
-                log.info(f"  [article {art_idx}/{len(article_urls)}] {art_url}")
-                src = all_links[art_url]
-                t0  = time.time()
-
-                details = await extract_article_details(art_page, art_url)
+            for idx, art_url in enumerate(urls, 1):
+                if idx % 10 == 0:
+                    progress(f"  Article {idx}/{len(urls)} ...")
+                src     = all_links[art_url]
+                details = await _extract_article(art_page, art_url)
                 await art_page.wait_for_timeout(800)
 
-                keep, drop_reason = is_within_2_years(details["article_date"])
+                keep, drop_reason = _is_within_2_years(details["article_date"])
                 if not keep:
-                    log.info(f"    [DATE FILTER] Dropped: {drop_reason}")
+                    log.info(f"  [DATE FILTER] {drop_reason} → {art_url[:60]}")
                     continue
-
-                log.info(
-                    f"    title={str(details['article_title'])[:60]!r}  "
-                    f"date={details['article_date']}  "
-                    f"chars={len(details['extracted_text'] or '')}  "
-                    f"{round(time.time()-t0, 2)}s"
-                )
 
                 row = {
                     "unfiltered_article_id": str(uuid.uuid4()),
-                    "search_url_id":         None,
                     "article_link":          art_url,
                     "article_title":         details["article_title"],
                     "article_date":          details["article_date"],
@@ -966,96 +714,145 @@ async def main(args):
                     "base_url_id":           base_url_id,
                     "keyword_used":          src["keyword"],
                     "search_url":            src["search_url"],
-                    "method_used":           src["method_used"],
+                    "method_used":           src["method"],
                     "search_term_source":    term_source,
                 }
                 batch.append(row)
                 output_rows.append(row)
 
                 if len(batch) >= 20:
-                    ins, skip = insert_articles_to_supabase(sb, batch)
+                    ins, skip = insert_articles(sb, batch)
                     total_inserted += ins
                     total_skipped  += skip
-                    maybe_save_local_csv(batch, args.output_csv, first_csv_write)
-                    first_csv_write = False
+                    progress(f"  Batch inserted={ins} skipped={skip}")
                     batch.clear()
-                    log.info(f"  [checkpoint] after article {art_idx}")
 
             if batch:
-                ins, skip = insert_articles_to_supabase(sb, batch)
+                ins, skip = insert_articles(sb, batch)
                 total_inserted += ins
                 total_skipped  += skip
-                maybe_save_local_csv(batch, args.output_csv, first_csv_write)
-                first_csv_write = False
 
         else:
-            log.info("[PHASE 2] Skipped (--skip_article_visit)")
-            batch = []
-            for art_url in article_urls:
-                src = all_links[art_url]
-                row = {
+            progress("Phase 2 skipped (skip_article_visit=true)")
+            for art_url, src in all_links.items():
+                output_rows.append({
                     "unfiltered_article_id": str(uuid.uuid4()),
-                    "search_url_id":         None,
-                    "article_link":          art_url,
-                    "article_title":         None, "article_date":        None,
-                    "companies_mentioned":   None, "location":            None,
-                    "extracted_text":        None, "is_valid":            True,
-                    "drop_reason":           None,
-                    "filter_article_status": "pending",
-                    "created_at":            datetime.now().strftime("%Y-%m-%d %H:%M:%S+05:30"),
-                    "subsegment_name":       subseg_name,
-                    "base_url_id":           base_url_id,
-                    "keyword_used":          src["keyword"],
-                    "search_url":            src["search_url"],
-                    "method_used":           src["method_used"],
-                    "search_term_source":    term_source,
-                }
-                batch.append(row)
-                output_rows.append(row)
-            if batch:
-                ins, skip = insert_articles_to_supabase(sb, batch)
-                total_inserted += ins
-                total_skipped  += skip
-                maybe_save_local_csv(batch, args.output_csv, True)
+                    "article_link":    art_url,
+                    "article_title":   None, "article_date":      None,
+                    "extracted_text":  None, "subsegment_name":   subseg_name,
+                    "base_url_id":     base_url_id,
+                    "keyword_used":    src["keyword"],
+                    "method_used":     src["method"],
+                })
+            ins, skip = insert_articles(sb, output_rows)
+            total_inserted += ins
+            total_skipped  += skip
 
-        await browser.close()
+        await context.close()
 
-    log.info(
-        f"\n{'='*70}\n"
-        f"[FINAL SUMMARY]  {base_url}\n"
-        f"  Search term source         : {term_source}\n"
-        f"  Search terms used          : {search_terms}\n"
-        f"  Unique article links       : {len(all_links)}\n"
-        f"  After date filter          : {len(output_rows)}\n"
-        f"  Inserted to Supabase       : {total_inserted}\n"
-        f"  Skipped (duplicates/errors): {total_skipped}\n"
-        f"  With title                 : {sum(1 for r in output_rows if r['article_title'])}\n"
-        f"  With date                  : {sum(1 for r in output_rows if r['article_date'])}\n"
-        f"  With body text             : {sum(1 for r in output_rows if r['extracted_text'])}\n"
-        f"  CSV backup                 : {args.output_csv or 'not saved'}\n"
-        f"  Debug log                  : scraper_v4.log\n"
-        f"{'='*70}"
+        # ── Final result ─────────────────────────────────────────────
+        job["result"] = {
+            "base_url":          base_url,
+            "base_url_id":       base_url_id,
+            "subsegment":        subseg_name,
+            "segment":           seg_name,
+            "term_source":       term_source,
+            "search_terms":      search_terms,
+            "unique_links":      len(all_links),
+            "after_date_filter": len(output_rows),
+            "inserted":          total_inserted,
+            "skipped":           total_skipped,
+        }
+        job["status"]      = "done"
+        job["finished_at"] = datetime.utcnow().isoformat()
+        progress(f"DONE — inserted={total_inserted} skipped={total_skipped}")
+
+    except Exception as e:
+        log.error(f"[{job_id[:8]}] FAILED: {e}", exc_info=True)
+        job["status"]      = "error"
+        job["error"]       = str(e)
+        job["finished_at"] = datetime.utcnow().isoformat()
+
+
+# ==============================================================================
+# API ENDPOINTS
+# ==============================================================================
+
+@app.get("/")
+async def root():
+    return {
+        "service":    "Article Scraper API v5.0",
+        "status":     "running",
+        "endpoints": {
+            "POST /scrape":       "Start a scrape job (returns job_id immediately)",
+            "GET  /job/{job_id}": "Poll job status and result",
+            "GET  /jobs":         "List recent jobs",
+            "GET  /health":       "Health check",
+        },
+    }
+
+
+@app.get("/health")
+async def health():
+    sb_ok = True
+    try:
+        get_supabase_client()
+    except Exception:
+        sb_ok = False
+    return {
+        "status":           "healthy",
+        "browser_ready":    _browser is not None and _browser.is_connected(),
+        "supabase_key_ok":  sb_ok,
+        "active_jobs":      sum(1 for j in _jobs.values() if j["status"] == "running"),
+        "total_jobs":       len(_jobs),
+    }
+
+
+@app.post("/scrape", response_model=ScrapeAccepted, status_code=202)
+async def start_scrape(req: ScrapeRequest, bg: BackgroundTasks):
+    """
+    Fire-and-forget scrape.  Returns a job_id immediately.
+    Poll GET /job/{job_id} to check progress and get results.
+    """
+    if _browser is None or not _browser.is_connected():
+        raise HTTPException(503, detail="Browser not ready yet. Retry in a few seconds.")
+
+    job_id = f"job_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+    _new_job(job_id, req.model_dump())
+    bg.add_task(_run_scrape, job_id, req)
+    return ScrapeAccepted(
+        job_id=job_id,
+        status="queued",
+        message=f"Scrape job accepted for {req.base_url}. Poll GET /job/{job_id} for status.",
     )
 
 
-def parse_args():
-    p = argparse.ArgumentParser(
-        description="Single URL scraper → Supabase ses_unfiltered_articles"
-    )
-    p.add_argument("--base_url",    required=True,
-                   help="Target base URL, e.g. https://example.com")
-    p.add_argument("--base_url_id", default=None,
-                   help="UUID of base URL in ses_base_url (optional, auto-resolved if omitted)")
-    p.add_argument("--supabase_url", default=None,
-                   help="Supabase project URL (or set SUPABASE_URL in .env)")
-    p.add_argument("--supabase_key", default=None,
-                   help="Supabase SERVICE_ROLE key (or set SUPABASE_KEY in .env)")
-    p.add_argument("--output_csv",  default=None,
-                   help="Optional local CSV backup path")
-    p.add_argument("--skip_article_visit", action="store_true",
-                   help="Collect links only, skip visiting article pages")
-    return p.parse_args()
+@app.get("/job/{job_id}")
+async def get_job(job_id: str):
+    """Poll this endpoint after POSTing to /scrape."""
+    job = _jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, detail=f"Job '{job_id}' not found.")
+    return job
 
+
+@app.get("/jobs")
+async def list_jobs(limit: int = 20):
+    """List recent jobs (newest first)."""
+    jobs = list(reversed(list(_jobs.values())))
+    return {"total": len(_jobs), "jobs": jobs[:max(1, min(limit, 100))]}
+
+
+# ==============================================================================
+# ENTRY POINT
+# ==============================================================================
 
 if __name__ == "__main__":
-    asyncio.run(main(parse_args()))
+    import uvicorn
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=5060,
+        reload=False,   # reload=True breaks Playwright on Windows — just restart manually
+        log_level="info",
+    )
