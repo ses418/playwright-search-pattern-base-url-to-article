@@ -24,14 +24,14 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-COPY requirements.txt .
+# IMPORTANT: copy from subfolder
+COPY base_url_to_article/requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r requirements.txt
 
-# IMPORTANT: only this, NOT install-deps
 RUN playwright install chromium
 
-COPY . .
+COPY base_url_to_article/ .
 
 EXPOSE 5060
 
