@@ -35,4 +35,4 @@ COPY base_url_to_article/ .
 
 EXPOSE 5060
 
-CMD ["uvicorn", "api_extractor_playwright:app", "--host", "0.0.0.0", "--port", "5060"]
+CMD ["uvicorn", "base_url_to_article.main:app", "--host", "0.0.0.0", "--port", "5060"]
