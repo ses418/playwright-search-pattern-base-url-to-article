@@ -149,7 +149,7 @@ class ScrapeRequest(BaseModel):
     base_url:            str           = Field(...,  description="Target URL, e.g. https://example.com")
     base_url_id:         Optional[str] = Field(None, description="UUID in ses_base_url (auto-resolved if omitted)")
     skip_article_visit:  bool          = Field(False, description="Collect links only, skip article detail pages")
-    output_csv:          Optional[str] = Field(None,  description="Optional local CSV backup path (server-side)")
+
 
 
 class ScrapeAccepted(BaseModel):
@@ -765,6 +765,7 @@ async def _run_scrape(job_id: str, req: ScrapeRequest):
         }
         job["status"]      = "done"
         job["finished_at"] = datetime.utcnow().isoformat()
+        log.info(f"[SUPABASE] ✓ {total_inserted} articles saved to ses_unfiltered_articles | {total_skipped} skipped (duplicates/errors)")
         progress(f"DONE — inserted={total_inserted} skipped={total_skipped}")
 
     except Exception as e:
@@ -856,3 +857,4 @@ if __name__ == "__main__":
         reload=False,   # reload=True breaks Playwright on Windows — just restart manually
         log_level="info",
     )
+    
