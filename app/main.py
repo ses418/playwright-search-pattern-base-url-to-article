@@ -50,24 +50,25 @@ async def background_runner():
 
 
 @app.get("/health")
-async def health():
+async def health_check():
     return {"status": "ok"}
 
 
 @app.post("/run-batch")
-async def run_batch_endpoint(background_tasks: BackgroundTasks):
+async def trigger_batch(background_tasks: BackgroundTasks):
+    """
+    Triggers a new batch processing job in the background.
+    """
     background_tasks.add_task(background_runner)
-    return {"message": "Batch started in background"}
+    return {"message": "Batch processing started in the background."}
+
 
 if __name__ == "__main__":
-    import os
     import uvicorn
-
-    port = int(os.getenv("PORT", 5070))  # default 5070 if not set
 
     uvicorn.run(
         "app.main:app",
         host="0.0.0.0",
-        port=port,
+        port=5070,
         reload=False
     )
