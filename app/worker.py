@@ -2,7 +2,7 @@ import asyncio
 import gc
 import logging
 from datetime import datetime
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, Error as PlaywrightError
 from app.detector import detect_search
 from app.db import save_search_pattern
 
@@ -14,10 +14,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-DOMAIN_CONCURRENCY = 1  # Reduced to 1 to prevent memory exhaustion
-NAVIGATION_TIMEOUT = 20000  # Reduced for faster failure detection
-POST_LOAD_WAIT = 500  # small stabilization wait
-DETECT_TIMEOUT = 15000  # safety guard
+DOMAIN_CONCURRENCY = 1  # Keep at 1 to prevent memory exhaustion
+NAVIGATION_TIMEOUT = 15000  # Reduced for faster failure detection
+POST_LOAD_WAIT = 300  # small stabilization wait
+DETECT_TIMEOUT = 10000  # safety guard
+MAX_RETRIES = 1  # Number of retries for browser launch
 
 
 async def process_domain(browser, domain, semaphore):
@@ -63,7 +64,15 @@ async def process_domain(browser, domain, semaphore):
                     success = True
                     break
 
-                except Exception:
+                except PlaywrightError as e:
+                    if "Target page, context or browser has been closed" in str(e):
+                        logger.error(f"Browser crashed while processing {base_url}")
+                        raise
+                    if attempt == 1:
+                        raise
+                    logger.warning(f"Retrying {base_url} due to error: {e}")
+
+                except Exception as e:
                     if attempt == 1:
                         raise
                     logger.warning(f"Retrying {base_url} due to timeout...")
@@ -91,6 +100,8 @@ async def process_domain(browser, domain, semaphore):
             else:
                 logger.warning(f"Not Found: {base_url}")
 
+        except PlaywrightError as e:
+            logger.error(f"Playwright error for {base_url}: {e}")
         except Exception as e:
             logger.error(f"ERROR: {base_url} -> {str(e)}")
 
@@ -99,7 +110,10 @@ async def process_domain(browser, domain, semaphore):
                 await page.close()
             except:
                 pass
-            await context.close()
+            try:
+                await context.close()
+            except:
+                pass
 
 
 async def run_batch(domains, domains_since_restart=0):
@@ -107,39 +121,57 @@ async def run_batch(domains, domains_since_restart=0):
     semaphore = asyncio.Semaphore(DOMAIN_CONCURRENCY)
 
     async with async_playwright() as p:
+        browser = None
+        for attempt in range(MAX_RETRIES):
+            try:
+                browser = await p.chromium.launch(
+                    headless=True,
+                    args=[
+                        "--disable-blink-features=AutomationControlled",
+                        "--no-sandbox",
+                        "--disable-dev-shm-usage",
+                        "--disable-gpu",
+                        "--disable-web-security",
+                        "--disable-features=IsolateOrigins,site-per-process",
+                        "--single-process",
+                        "--disable-extensions",
+                        "--disable-default-apps",
+                        "--disable-background-networking",
+                        "--disable-background-timer-throttling",
+                        "--disable-backgrounding-occluded-windows",
+                        "--disable-renderer-backgrounding",
+                        "--disable-accelerated-2d-canvas",
+                        "--disable-accelerated-video-decode",
+                    ]
+                )
+                break
+            except Exception as e:
+                logger.error(f"Browser launch attempt {attempt + 1} failed: {e}")
+                if attempt == MAX_RETRIES - 1:
+                    raise
+                await asyncio.sleep(2)
 
-        browser = await p.chromium.launch(
-            headless=True,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--disable-web-security",
-                "--disable-features=IsolateOrigins,site-per-process",
-                "--single-process",
-                "--disable-extensions",
-                "--disable-default-apps",
-                "--disable-background-networking",
-                "--disable-background-timer-throttling",
-                "--disable-backgrounding-occluded-windows",
-                "--disable-renderer-backgrounding",
+        if not browser:
+            logger.error("Failed to launch browser after retries")
+            return
+
+        try:
+            tasks = [
+                process_domain(browser, domain, semaphore)
+                for domain in domains
             ]
-        )
 
-        tasks = [
-            process_domain(browser, domain, semaphore)
-            for domain in domains
-        ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        # 🔥 Log unexpected task-level exceptions
-        for r in results:
-            if isinstance(r, Exception):
-                logger.error("Unhandled task exception: %s", str(r))
-
-        await browser.close()
+            # 🔥 Log unexpected task-level exceptions
+            for r in results:
+                if isinstance(r, Exception):
+                    logger.error("Unhandled task exception: %s", str(r))
+        finally:
+            try:
+                await browser.close()
+            except Exception as e:
+                logger.warning(f"Error closing browser: {e}")
 
     # Force garbage collection after browser closes
     gc.collect()

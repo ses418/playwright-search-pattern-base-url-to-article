@@ -1,5 +1,5 @@
 # Use official Playwright image (already includes browsers + deps)
-FROM mcr.microsoft.com/playwright/python:v1.58.0-jammy
+FROM mcr.microsoft.com/playwright/python:v1.43.0-jammy
 
 WORKDIR /app
 

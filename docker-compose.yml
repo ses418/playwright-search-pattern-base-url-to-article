@@ -16,11 +16,11 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "2"
-          memory: 4G
+          cpus: "1.5"
+          memory: 3G
         reservations:
-          cpus: "1"
-          memory: 2G
+          cpus: "0.5"
+          memory: 1G
     # Restart policy - use unless-stopped to prevent crash loops
     restart: unless-stopped
     # Health check
@@ -35,3 +35,8 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+    # Security options
+    security_opt:
+      - seccomp:unconfined
+    cap_add:
+      - SYS_ADMIN

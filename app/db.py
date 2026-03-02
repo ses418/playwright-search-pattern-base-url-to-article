@@ -45,15 +45,19 @@ async def fetch_unprocessed_base_urls(limit=100):
         return []
 
 
-async def save_search_pattern(base_url_id, pattern, strategy_used):
+async def save_search_pattern(base_url_id, base_url, result):
     """
     Saves the detected search pattern and marks the base_url as processed.
     """
     try:
+        pattern = result.get("pattern")
+        strategy_used = result.get("method")
+
         # Upsert the search pattern
         supabase.from_("search_patterns").upsert(
             {
                 "base_url_id": base_url_id,
+                "base_url": base_url,
                 "pattern": pattern,
                 "strategy_used": strategy_used,
             }
