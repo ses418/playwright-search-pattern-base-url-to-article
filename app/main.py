@@ -1,44 +1,79 @@
 import asyncio
+import logging
+import signal
 from fastapi import FastAPI, BackgroundTasks
 from app.db import fetch_unprocessed_base_urls
 from app.worker import run_batch
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
 BATCH_SIZE = 100  # Adjust as needed
 
-app = FastAPI(title="Search Pattern Discovery Service")
+
+async def lifespan(app: FastAPI):
+    # Startup
+    logger.info("Application starting up...")
+    yield
+    # Shutdown
+    logger.info("Application shutting down...")
+    shutdown_event.set()
+
+
+app = FastAPI(title="Search Pattern Discovery Service", lifespan=lifespan)
 
 is_running = False  # Prevent parallel runs
+shutdown_event = asyncio.Event()
+
+
+def handle_shutdown(signum, frame):
+    logger.info(f"Received signal {signum}, initiating graceful shutdown...")
+    shutdown_event.set()
+
+
+# Register signal handlers for graceful shutdown
+signal.signal(signal.SIGTERM, handle_shutdown)
+signal.signal(signal.SIGINT, handle_shutdown)
 
 
 async def main():
 
-    print("Starting batch processing...")
+    logger.info("Starting batch processing...")
 
     total_processed = 0
 
-    while True:
+    while not shutdown_event.is_set():
+
+        # Check for shutdown signal
+        if shutdown_event.is_set():
+            logger.info("Shutdown signal received, stopping batch...")
+            break
 
         # 🔥 Fetch only unprocessed rows
         domains = await fetch_unprocessed_base_urls(limit=BATCH_SIZE)
 
         if not domains:
+            logger.info("No more domains to process.")
             break
 
-        print(f"Fetched unprocessed batch: {len(domains)}")
+        logger.info(f"Fetched unprocessed batch: {len(domains)}")
 
         await run_batch(domains)
 
         total_processed += len(domains)
 
-    print("\n✅ All batches completed.")
-    print(f"Total processed in this run: {total_processed}")
+    logger.info(f"All batches completed. Total processed in this run: {total_processed}")
 
 
 async def background_runner():
     global is_running
 
     if is_running:
-        print("Batch already running.")
+        logger.warning("Batch already running.")
         return
 
     is_running = True
@@ -60,6 +95,15 @@ async def trigger_batch(background_tasks: BackgroundTasks):
     """
     background_tasks.add_task(background_runner)
     return {"message": "Batch processing started in the background."}
+
+
+@app.post("/shutdown")
+async def shutdown_server():
+    """
+    Gracefully shuts down the server.
+    """
+    shutdown_event.set()
+    return {"message": "Shutdown signal sent. Server will stop after current task."}
 
 
 if __name__ == "__main__":

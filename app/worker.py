@@ -1,11 +1,20 @@
 import asyncio
+import logging
+from datetime import datetime
 from playwright.async_api import async_playwright
 from app.detector import detect_search
 from app.db import save_search_pattern
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
 
 DOMAIN_CONCURRENCY = 2  # increase in production
-NAVIGATION_TIMEOUT = 10000
+NAVIGATION_TIMEOUT = 30000
 POST_LOAD_WAIT = 500  # small stabilization wait
 DETECT_TIMEOUT = 20000  # safety guard
 
@@ -35,7 +44,7 @@ async def process_domain(browser, domain, semaphore):
 
         page = await context.new_page()
 
-        print(f"Processing: {base_url}")
+        logger.info(f"Processing: {base_url}")
 
         try:
             success = False
@@ -56,10 +65,10 @@ async def process_domain(browser, domain, semaphore):
                 except Exception:
                     if attempt == 1:
                         raise
-                    print(f"Retrying {base_url} due to timeout...")
+                    logger.warning(f"Retrying {base_url} due to timeout...")
 
             if not success:
-                print(f"✘ Not Found: {base_url}")
+                logger.warning(f"Not Found: {base_url}")
                 return
 
             # 🔥 Detection timeout safety
@@ -76,13 +85,13 @@ async def process_domain(browser, domain, semaphore):
                     result=result
                 )
 
-                print(f"✔ Saved: {base_url} -> {result}")
+                logger.info(f"✔ Saved: {base_url} -> {result}")
 
             else:
-                print(f"✘ Not Found: {base_url}")
+                logger.warning(f"Not Found: {base_url}")
 
         except Exception as e:
-            print(f"ERROR: {base_url} -> {str(e)}")
+            logger.error(f"ERROR: {base_url} -> {str(e)}")
 
         finally:
             try:
@@ -104,6 +113,10 @@ async def run_batch(domains):
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-web-security",
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--single-process",
             ]
         )
 
