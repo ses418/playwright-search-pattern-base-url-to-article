@@ -1,7 +1,7 @@
 # Use official Playwright image (already includes browsers + deps)
 FROM mcr.microsoft.com/playwright/python:v1.43.0-jammy
 
-WORKDIR /app
+WORKDIR /app/search_pattern_discovery
 
 # Copy only requirements first (better Docker caching)
 COPY requirements.txt .
