@@ -13,4 +13,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Add a command to run the application with an environment file
-CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port 5070 --no-reload"]
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port 5070"]
