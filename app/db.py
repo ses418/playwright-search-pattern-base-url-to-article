@@ -1,16 +1,19 @@
 import os
-from dotenv import load_dotenv
 from supabase import create_client, Client
 
-load_dotenv()  # Load environment variables from .env file
 
+# Load environment variables
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
-
+# Enforce that environment variables are set
 if not SUPABASE_URL or not SUPABASE_KEY:
-    raise ValueError("Supabase credentials not found in environment variables.")
+    raise ValueError(
+        "Supabase credentials not found. Please set SUPABASE_URL and SUPABASE_KEY in your environment."
+    )
 
+# Initialize Supabase client
+# This will now only execute if the credentials are valid
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 

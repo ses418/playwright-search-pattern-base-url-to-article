@@ -2,7 +2,7 @@ import asyncio
 from fastapi import FastAPI, BackgroundTasks
 from app.db import fetch_unprocessed_base_urls
 from app.worker import run_batch
-
+from dotenv import load_dotenv
 
 BATCH_SIZE = 100  # Adjust as needed
 
@@ -64,6 +64,9 @@ async def trigger_batch(background_tasks: BackgroundTasks):
 
 
 if __name__ == "__main__":
+    from dotenv import load_dotenv
+
+    load_dotenv()
     import uvicorn
 
     uvicorn.run(
