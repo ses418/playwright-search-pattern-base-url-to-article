@@ -11,17 +11,17 @@ services:
     env_file:
       - .env
     # Increase shared memory to prevent browser crashes
-    shm_size: "1gb"
-    # Resource limits
+    shm_size: "2gb"
+    # Resource limits - CRITICAL for production stability
     deploy:
       resources:
         limits:
           cpus: "2"
-          memory: 2G
+          memory: 4G
         reservations:
           cpus: "1"
-          memory: 1G
-    # Restart policy
+          memory: 2G
+    # Restart policy - use unless-stopped to prevent crash loops
     restart: unless-stopped
     # Health check
     healthcheck:

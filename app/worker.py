@@ -1,4 +1,5 @@
 import asyncio
+import gc
 import logging
 from datetime import datetime
 from playwright.async_api import async_playwright
@@ -13,10 +14,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-DOMAIN_CONCURRENCY = 2  # increase in production
-NAVIGATION_TIMEOUT = 30000
+DOMAIN_CONCURRENCY = 1  # Reduced to 1 to prevent memory exhaustion
+NAVIGATION_TIMEOUT = 20000  # Reduced for faster failure detection
 POST_LOAD_WAIT = 500  # small stabilization wait
-DETECT_TIMEOUT = 20000  # safety guard
+DETECT_TIMEOUT = 15000  # safety guard
 
 
 async def process_domain(browser, domain, semaphore):
@@ -101,7 +102,7 @@ async def process_domain(browser, domain, semaphore):
             await context.close()
 
 
-async def run_batch(domains):
+async def run_batch(domains, domains_since_restart=0):
 
     semaphore = asyncio.Semaphore(DOMAIN_CONCURRENCY)
 
@@ -117,6 +118,12 @@ async def run_batch(domains):
                 "--disable-web-security",
                 "--disable-features=IsolateOrigins,site-per-process",
                 "--single-process",
+                "--disable-extensions",
+                "--disable-default-apps",
+                "--disable-background-networking",
+                "--disable-background-timer-throttling",
+                "--disable-backgrounding-occluded-windows",
+                "--disable-renderer-backgrounding",
             ]
         )
 
@@ -130,6 +137,10 @@ async def run_batch(domains):
         # 🔥 Log unexpected task-level exceptions
         for r in results:
             if isinstance(r, Exception):
-                print("Unhandled task exception:", str(r))
+                logger.error("Unhandled task exception: %s", str(r))
 
         await browser.close()
+
+    # Force garbage collection after browser closes
+    gc.collect()
+    logger.info("Browser closed and garbage collected")

@@ -1,8 +1,10 @@
 import asyncio
+import gc
 import logging
 import signal
+import time
 from fastapi import FastAPI, BackgroundTasks
-from app.db import fetch_unprocessed_base_urls
+from app.db import fetch_unprocessed_base_urls, acquire_batch_lock, release_batch_lock
 from app.worker import run_batch
 
 # Configure logging
@@ -12,7 +14,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BATCH_SIZE = 100  # Adjust as needed
+BATCH_SIZE = 50  # Reduced from 100 to lower memory pressure
+DOMAINS_PER_BROWSER = 25  # Restart browser after this many domains
+shutdown_event = asyncio.Event()
+batch_status = {"running": False, "last_run": None, "total_processed": 0}
 
 
 async def lifespan(app: FastAPI):
@@ -22,17 +27,16 @@ async def lifespan(app: FastAPI):
     # Shutdown
     logger.info("Application shutting down...")
     shutdown_event.set()
+    release_batch_lock()  # Ensure lock is released on shutdown
 
 
 app = FastAPI(title="Search Pattern Discovery Service", lifespan=lifespan)
-
-is_running = False  # Prevent parallel runs
-shutdown_event = asyncio.Event()
 
 
 def handle_shutdown(signum, frame):
     logger.info(f"Received signal {signum}, initiating graceful shutdown...")
     shutdown_event.set()
+    release_batch_lock()
 
 
 # Register signal handlers for graceful shutdown
@@ -45,6 +49,7 @@ async def main():
     logger.info("Starting batch processing...")
 
     total_processed = 0
+    domains_since_restart = 0
 
     while not shutdown_event.is_set():
 
@@ -62,30 +67,55 @@ async def main():
 
         logger.info(f"Fetched unprocessed batch: {len(domains)}")
 
-        await run_batch(domains)
+        # Run batch with memory management
+        await run_batch(domains, domains_since_restart)
 
         total_processed += len(domains)
+        domains_since_restart += len(domains)
+
+        # Force garbage collection after each batch
+        gc.collect()
+
+        # Check if we need to restart the browser (memory management)
+        if domains_since_restart >= DOMAINS_PER_BROWSER:
+            logger.info(f"Processed {domains_since_restart} domains, triggering browser restart...")
+            domains_since_restart = 0
 
     logger.info(f"All batches completed. Total processed in this run: {total_processed}")
+    batch_status["total_processed"] += total_processed
 
 
 async def background_runner():
-    global is_running
 
-    if is_running:
+    if batch_status["running"]:
         logger.warning("Batch already running.")
         return
 
-    is_running = True
+    # Try to acquire database lock
+    if not acquire_batch_lock():
+        logger.warning("Could not acquire batch lock. Another instance may be running.")
+        return
+
+    batch_status["running"] = True
+    batch_status["last_run"] = time.time()
+
     try:
         await main()
+    except Exception as e:
+        logger.error(f"Batch processing failed: {e}")
     finally:
-        is_running = False
+        batch_status["running"] = False
+        release_batch_lock()
 
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "batch_running": batch_status["running"],
+        "last_run": batch_status["last_run"],
+        "total_processed": batch_status["total_processed"]
+    }
 
 
 @app.post("/run-batch")

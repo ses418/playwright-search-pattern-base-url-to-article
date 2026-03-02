@@ -1,4 +1,5 @@
 import os
+import time
 from supabase import create_client, Client
 
 
@@ -15,6 +16,10 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 # Initialize Supabase client
 # This will now only execute if the credentials are valid
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# Lock configuration
+LOCK_KEY = "batch_processing_lock"
+LOCK_EXPIRY_SECONDS = 1800  # 30 minutes
 
 
 async def fetch_unprocessed_base_urls(limit=100):
@@ -61,3 +66,38 @@ async def save_search_pattern(base_url_id, pattern, strategy_used):
 
     except Exception as e:
         print(f"Error saving search pattern: {e}")
+
+
+def acquire_batch_lock(max_retries=3, retry_delay=2):
+    """
+    Attempts to acquire a batch processing lock.
+    Returns True if lock acquired, False otherwise.
+    """
+    for attempt in range(max_retries):
+        try:
+            # Try to insert a lock record
+            response = supabase.table("batch_locks").upsert({
+                "lock_key": LOCK_KEY,
+                "locked_at": time.time(),
+                "expires_at": time.time() + LOCK_EXPIRY_SECONDS
+            }, on_conflict="lock_key").execute()
+
+            # Check if we got the lock
+            if response.data:
+                return True
+
+        except Exception as e:
+            print(f"Lock acquisition attempt {attempt + 1} failed: {e}")
+            time.sleep(retry_delay)
+
+    return False
+
+
+def release_batch_lock():
+    """
+    Releases the batch processing lock.
+    """
+    try:
+        supabase.table("batch_locks").delete().eq("lock_key", LOCK_KEY).execute()
+    except Exception as e:
+        print(f"Error releasing lock: {e}")
