@@ -12,8 +12,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy rest of the project
 COPY . .
 
-# Expose your FastAPI port
-EXPOSE 5070
-
-# Start app
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "5070"]
+# Add a command to run the application with an environment file
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port 5070"]
