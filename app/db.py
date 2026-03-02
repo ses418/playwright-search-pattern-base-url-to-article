@@ -25,7 +25,7 @@ async def fetch_unprocessed_base_urls(limit=100):
         response = (
             supabase.from_("ses_base_url")
             .select("base_url_id, base_url")
-            .eq("processed", "FALSE")
+            .eq("search_processed", "FALSE")
             .limit(limit)
             .execute()
         )
@@ -55,7 +55,7 @@ async def save_search_pattern(base_url_id, pattern, strategy_used):
         ).execute()
 
         # Mark as processed
-        supabase.from_("base_urls").update({"processed": "TRUE"}).eq(
+        supabase.from_("ses_base_url").update({"search_processed": "TRUE"}).eq(
             "base_url_id", base_url_id
         ).execute()
 
