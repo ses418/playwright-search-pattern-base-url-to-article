@@ -33,6 +33,8 @@ SEARCH_URL_PATTERNS = [
     "/en/search?q={}",
     "/global/search?q={}",
     "search/?k={}",
+    "archive/?q={}",
+    "catalog/?q={}",
 ]
 
 
