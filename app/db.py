@@ -23,7 +23,7 @@ async def fetch_unprocessed_base_urls(limit=100):
     """
     try:
         response = (
-            supabase.from_("base_urls")
+            supabase.from_("ses_base_url")
             .select("base_url_id, base_url")
             .eq("processed", "FALSE")
             .limit(limit)
