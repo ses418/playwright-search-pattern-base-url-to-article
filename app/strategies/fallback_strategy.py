@@ -11,9 +11,11 @@ class FallbackStrategy(BaseSearchStrategy):
                 if href and "search" in href.lower():
                     return {
                         "method": "fallback",
-                        "pattern": href
+                        "pattern": href,
+                        "confidence": 1,
+                        "result_type": "fallback-link"
                     }
-        except:
+        except Exception:
             pass
 
         return None

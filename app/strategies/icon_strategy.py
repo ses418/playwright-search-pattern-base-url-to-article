@@ -1,6 +1,8 @@
 import asyncio
+import logging
 from app.strategies.base import BaseSearchStrategy
 
+logger = logging.getLogger(__name__)
 
 ICON_SELECTORS = [
 
@@ -49,6 +51,29 @@ ICON_SELECTORS = [
     "button svg",
 ]
 
+# Short list of high-signal input selectors to try after icon click
+# (not the full 170+ list — that was causing O(n²) slowness)
+ICON_INPUT_SELECTORS = [
+    "input[type='search']",
+    "input[name='q']",
+    "input[name='query']",
+    "input[name='s']",
+    "input[name='search']",
+    "input[placeholder*='Search']",
+    "input[placeholder*='search']",
+    "input[class*='search']",
+    "input[id*='search']",
+    "[role='search'] input",
+    "form[action*='search'] input",
+    "input[aria-label*='Search']",
+    "input[aria-label*='search']",
+    "input[name='keyword']",
+    "input[name='keys']",
+    "#search",
+    "#search-input",
+    "#search-field",
+]
+
 
 class IconSearchStrategy(BaseSearchStrategy):
 
@@ -56,7 +81,6 @@ class IconSearchStrategy(BaseSearchStrategy):
 
     async def execute(self):
 
-        from app.strategies.input_strategy import INPUT_SELECTORS
         from app.executor import execute_search
 
         for selector in ICON_SELECTORS:
@@ -77,26 +101,35 @@ class IconSearchStrategy(BaseSearchStrategy):
                         "input",
                         timeout=3000
                     )
-                except:
+                except Exception:
                     pass
 
-                # Try all input selectors after icon click
-                for input_selector in INPUT_SELECTORS:
+                # Try only the short high-signal input selectors
+                for input_selector in ICON_INPUT_SELECTORS:
 
-                    score, result_type = await execute_search(
-                        self.page,
-                        input_selector
-                    )
+                    try:
+                        input_el = await self.page.query_selector(input_selector)
+                        if not input_el or not await input_el.is_visible():
+                            continue
 
-                    if score >= self.CONFIDENCE_THRESHOLD:
-                        return {
-                            "method": "icon",
-                            "pattern": selector,
-                            "confidence": score,
-                            "result_type": result_type
-                        }
+                        score, result_type = await execute_search(
+                            self.page,
+                            input_selector
+                        )
 
-            except:
+                        if score >= self.CONFIDENCE_THRESHOLD:
+                            return {
+                                "method": "icon",
+                                "pattern": selector,
+                                "confidence": score,
+                                "result_type": result_type
+                            }
+                    except Exception as e:
+                        logger.debug(f"Icon input {input_selector} failed: {e}")
+                        continue
+
+            except Exception as e:
+                logger.debug(f"Icon selector {selector} failed: {e}")
                 continue
 
         return None

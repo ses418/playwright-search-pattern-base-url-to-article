@@ -135,7 +135,7 @@ INPUT_SELECTORS = list(dict.fromkeys([
 
 # Coveo (enterprise search)
 "input[class*='coveo-search']",
-"input[data-coveo]"
+"input[data-coveo]",
 
 # ElasticSearch frontend patterns
 "input[class*='elastic']",
@@ -172,7 +172,7 @@ INPUT_SELECTORS = list(dict.fromkeys([
 
 class InputSearchStrategy(BaseSearchStrategy):
 
-    TEST_KEYWORD = "automationtest123"
+    TEST_KEYWORD = "test"
     CONFIDENCE_THRESHOLD = 3
 
     async def attach_network_listener(self):
@@ -216,7 +216,7 @@ class InputSearchStrategy(BaseSearchStrategy):
                         "domcontentloaded",
                         timeout=5000
                     )
-                except:
+                except Exception:
                     pass
 
                 # Strongest signal: network call
@@ -256,7 +256,7 @@ class InputSearchStrategy(BaseSearchStrategy):
                                 "domcontentloaded",
                                 timeout=5000
                             )
-                        except:
+                        except Exception:
                             pass
 
                         score, result_type = await execute_search(
@@ -272,10 +272,10 @@ class InputSearchStrategy(BaseSearchStrategy):
                                 "result_type": result_type
                             }
 
-                except:
+                except Exception:
                     pass
 
-            except:
+            except Exception:
                 continue
 
         return None

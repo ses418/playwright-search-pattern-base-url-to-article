@@ -1,10 +1,9 @@
 import asyncio
 import gc
 import logging
-from datetime import datetime
 from playwright.async_api import async_playwright, Error as PlaywrightError
 from app.detector import detect_search
-from app.db import save_search_pattern
+from app.db import save_search_pattern, mark_as_not_found
 
 # Configure logging
 logging.basicConfig(
@@ -14,20 +13,21 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-DOMAIN_CONCURRENCY = 1  # Keep at 1 to prevent memory exhaustion
-NAVIGATION_TIMEOUT = 30000  # Increased timeout for slow sites
-POST_LOAD_WAIT = 300  # small stabilization wait
-DETECT_TIMEOUT = 10000  # safety guard
-MAX_RETRIES = 3  # Number of retries for browser launch
+DOMAIN_CONCURRENCY = 1
+NAVIGATION_TIMEOUT = 30000  # ms
+POST_LOAD_WAIT = 500  # ms
+DETECT_TIMEOUT = 120  # seconds
+MAX_RETRIES = 3
 BROWSER_ARGS = [
     "--no-sandbox",
     "--disable-dev-shm-usage",
     "--disable-gpu",
     "--disable-web-security",
     "--disable-features=IsolateOrigins,site-per-process",
-    # NOTE: --single-process is intentionally removed: it causes the entire
-    # browser to crash when any page renderer hits a fault in Docker/Linux.
     "--disable-extensions",
+    "--disable-setuid-sandbox",
+    "--js-flags=--max-old-space-size=512",
+    "--memory-pressure-off",
     "--disable-default-apps",
     "--disable-background-networking",
     "--disable-background-timer-throttling",
@@ -36,8 +36,6 @@ BROWSER_ARGS = [
     "--disable-accelerated-2d-canvas",
     "--disable-accelerated-video-decode",
     "--disable-blink-features=AutomationControlled",
-    "--memory-pressure-off",
-    "--max_old_space_size=512",
 ]
 
 
@@ -58,9 +56,14 @@ async def launch_browser(p):
     return None
 
 
-async def process_domain(p, domain, semaphore):
-    """Process a single domain, launching its own browser if the shared one crashed."""
+async def process_domain(p, domain, semaphore, enhanced_mode=False):
+    """
+    Process a single domain.
 
+    Args:
+        enhanced_mode: If True, use enhanced detection (longer waits, networkidle).
+                       Used when retrying previously not-found URLs.
+    """
     base_url_id = domain["base_url_id"]
     base_url = domain["base_url"]
 
@@ -69,7 +72,6 @@ async def process_domain(p, domain, semaphore):
         context = None
         page = None
         try:
-            # Each domain gets its own fresh browser to avoid cross-domain crashes
             browser = await launch_browser(p)
 
             if not browser or not browser.is_connected():
@@ -94,20 +96,20 @@ async def process_domain(p, domain, semaphore):
 
             page = await context.new_page()
 
-            logger.info(f"Processing: {base_url}")
+            logger.info(f"Processing: {base_url} (enhanced={enhanced_mode})")
 
             success = False
+            nav_timeout = NAVIGATION_TIMEOUT * 2 if enhanced_mode else NAVIGATION_TIMEOUT
+            wait_until = "networkidle" if enhanced_mode else "domcontentloaded"
 
             for attempt in range(2):
                 try:
                     await page.goto(
                         base_url,
-                        timeout=NAVIGATION_TIMEOUT,
-                        wait_until="domcontentloaded"
+                        timeout=nav_timeout,
+                        wait_until=wait_until
                     )
-
-                    await page.wait_for_timeout(POST_LOAD_WAIT)
-
+                    await page.wait_for_timeout(1000 if enhanced_mode else POST_LOAD_WAIT)
                     success = True
                     break
 
@@ -119,37 +121,42 @@ async def process_domain(p, domain, semaphore):
                         logger.error(f"Playwright error for {base_url}: {e}")
                         return
                     logger.warning(f"Retrying {base_url} due to error: {e}")
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(2)
 
                 except Exception as e:
                     if attempt == 1:
                         logger.error(f"ERROR: {base_url} -> {str(e)}")
                         return
                     logger.warning(f"Retrying {base_url} due to timeout...")
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(2)
 
             if not success:
-                logger.warning(f"Not Found: {base_url}")
+                logger.warning(f"Navigation failed for {base_url}, marking as not-found")
+                await mark_as_not_found(base_url_id, base_url)
                 return
 
-            # Detection timeout safety
-            result = await asyncio.wait_for(
-                detect_search(page, base_url),
-                timeout=DETECT_TIMEOUT
-            )
+            # Detection
+            detect_timeout = DETECT_TIMEOUT * 2 if enhanced_mode else DETECT_TIMEOUT
+            try:
+                result = await asyncio.wait_for(
+                    detect_search(page, base_url, enhanced_mode=enhanced_mode),
+                    timeout=detect_timeout
+                )
+            except asyncio.TimeoutError:
+                logger.warning(f"Detection timed out for {base_url} after {detect_timeout}s")
+                await mark_as_not_found(base_url_id, base_url)
+                return
 
             if result and result.get("confidence", 0) > 0:
-
                 await save_search_pattern(
                     base_url_id=base_url_id,
                     base_url=base_url,
                     result=result
                 )
-
                 logger.info(f"✔ Saved: {base_url} -> {result}")
-
             else:
-                logger.warning(f"Not Found: {base_url}")
+                logger.warning(f"Not Found: {base_url} (no strategy matched)")
+                await mark_as_not_found(base_url_id, base_url)
 
         except PlaywrightError as e:
             logger.error(f"Playwright error for {base_url}: {e}")
@@ -160,38 +167,41 @@ async def process_domain(p, domain, semaphore):
             try:
                 if page:
                     await page.close()
-            except:
+            except Exception:
                 pass
             try:
                 if context:
                     await context.close()
-            except:
+            except Exception:
                 pass
             try:
                 if browser and browser.is_connected():
                     await browser.close()
-            except:
+            except Exception:
                 pass
             gc.collect()
 
 
-async def run_batch(domains, domains_since_restart=0):
+async def run_batch(domains, enhanced_mode=False):
+    """
+    Run a batch of domains through detection.
 
+    Args:
+        enhanced_mode: If True, use enhanced detection for all domains in batch.
+    """
     semaphore = asyncio.Semaphore(DOMAIN_CONCURRENCY)
 
     async with async_playwright() as p:
         tasks = [
-            process_domain(p, domain, semaphore)
+            process_domain(p, domain, semaphore, enhanced_mode=enhanced_mode)
             for domain in domains
         ]
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Log unexpected task-level exceptions
         for r in results:
             if isinstance(r, Exception):
                 logger.error("Unhandled task exception: %s", str(r))
 
-    # Force garbage collection after all domains processed
     gc.collect()
     logger.info("Batch complete, garbage collected")

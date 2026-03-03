@@ -1,7 +1,14 @@
+import logging
 from app.validator import validate_search, get_page_hash
 
+logger = logging.getLogger(__name__)
 
-async def execute_search(page, input_selector=None, keyword="automationtest123"):
+
+async def execute_search(page, input_selector=None, keyword="test"):
+    """
+    Execute a search by filling an input field and pressing Enter.
+    Returns (score, result_type) tuple from validation.
+    """
 
     original_url = page.url
     original_hash = await get_page_hash(page)
@@ -24,7 +31,8 @@ async def execute_search(page, input_selector=None, keyword="automationtest123")
 
                 return score, result_type
 
-    except:
+    except Exception as e:
+        logger.debug(f"execute_search failed for {input_selector}: {e}")
         return 0, "none"
 
     return 0, "none"

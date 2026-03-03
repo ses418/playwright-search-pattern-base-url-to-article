@@ -1,0 +1,12 @@
+{
+  "include": ["app"],
+  "exclude": ["**/__pycache__"],
+  "pythonVersion": "3.11",
+  "pythonPlatform": "Linux",
+  "venvPath": "C:\\Users\\Admin\\AppData\\Local\\Programs\\Python\\Python311",
+  "reportMissingImports": "none",
+  "reportMissingModuleSource": "none",
+  "reportGeneralTypeIssues": "none",
+  "reportOptionalMemberAccess": "none",
+  "reportUnknownMemberType": "none"
+}

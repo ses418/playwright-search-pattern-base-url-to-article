@@ -40,7 +40,7 @@ SEARCH_URL_PATTERNS = [
 
 class UrlSearchStrategy(BaseSearchStrategy):
 
-    TEST_KEYWORD = "automationtest123"
+    TEST_KEYWORD = "test"
     CONFIDENCE_THRESHOLD = 2
     FAST_TIMEOUT = 8000
     SLOW_TIMEOUT = 15000
@@ -58,7 +58,7 @@ class UrlSearchStrategy(BaseSearchStrategy):
                     wait_until="domcontentloaded"
                 )
                 return response
-            except:
+            except Exception:
                 continue
         return None
 
@@ -100,7 +100,7 @@ class UrlSearchStrategy(BaseSearchStrategy):
                         continue
 
                     # Structured validation scoring
-                    score = await validate_search(
+                    score, result_type = await validate_search(
                         temp_page,
                         original_url=self.base_url,
                         original_hash=None,
@@ -112,10 +112,10 @@ class UrlSearchStrategy(BaseSearchStrategy):
                             "method": "url",
                             "pattern": pattern,
                             "confidence": score,
-                            "result_type": "url"
+                            "result_type": result_type
                         }
 
-                except:
+                except Exception:
                     continue
 
         finally:
