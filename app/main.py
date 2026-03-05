@@ -28,13 +28,14 @@ batch_status = {
 }
 
 # Scheduler instance
-POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL_SECONDS", "300"))
+POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL_SECONDS", "86400"))
 scheduler = Scheduler(poll_interval=POLL_INTERVAL, batch_size=BATCH_SIZE)
 
 
 async def lifespan(app: FastAPI):
     logger.info("Application starting up...")
-    logger.info(f"Auto-scheduler will poll every {POLL_INTERVAL}s for new URLs")
+    poll_hours = POLL_INTERVAL / 3600
+    logger.info(f"Auto-scheduler will poll every {poll_hours:.1f}h ({POLL_INTERVAL}s) for new URLs")
     await scheduler.start()
     yield
     logger.info("Application shutting down...")
@@ -172,6 +173,33 @@ async def trigger_retry(background_tasks: BackgroundTasks):
     """Only retry not-found URLs with enhanced strategies."""
     background_tasks.add_task(retry_runner)
     return {"message": "Retrying not-found URLs with enhanced mode."}
+
+
+@app.post("/process-url")
+async def process_single_url(payload: dict, background_tasks: BackgroundTasks):
+    """
+    Immediately process a single URL.
+    Can be called manually or by a Supabase database webhook on INSERT.
+    
+    Accepts either:
+    - Supabase webhook format: {"record": {"base_url_id": "...", "base_url": "..."}}
+    - Direct format: {"base_url_id": "...", "base_url": "..."}
+    """
+    # Support both Supabase webhook format and direct format
+    record = payload.get("record", payload)
+    base_url_id = record.get("base_url_id")
+    base_url = record.get("base_url")
+
+    if not base_url_id or not base_url:
+        return {"error": "Missing base_url_id or base_url", "status": "failed"}
+
+    async def _process():
+        from app.worker import run_batch as _run
+        logger.info(f"Webhook: Processing single URL {base_url}")
+        await _run([{"base_url_id": base_url_id, "base_url": base_url}])
+
+    background_tasks.add_task(_process)
+    return {"message": f"Processing {base_url}", "status": "started"}
 
 
 @app.post("/scheduler/start")

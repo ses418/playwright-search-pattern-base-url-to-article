@@ -131,7 +131,7 @@ async def detect_search(page, base_url, enhanced_mode=False):
             if current_url.rstrip("/").lower() != base_url.rstrip("/").lower():
                 logger.info(f"Resetting page to {base_url} before {strategy_name}")
                 try:
-                    wait_until = "networkidle" if enhanced_mode else "domcontentloaded"
+                    wait_until = "load" if enhanced_mode else "domcontentloaded"
                     await page.goto(
                         base_url,
                         timeout=20000 if enhanced_mode else 15000,

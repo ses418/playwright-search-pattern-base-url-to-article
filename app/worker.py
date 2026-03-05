@@ -100,7 +100,7 @@ async def process_domain(p, domain, semaphore, enhanced_mode=False):
 
             success = False
             nav_timeout = NAVIGATION_TIMEOUT * 2 if enhanced_mode else NAVIGATION_TIMEOUT
-            wait_until = "networkidle" if enhanced_mode else "domcontentloaded"
+            wait_until = "load" if enhanced_mode else "domcontentloaded"
 
             for attempt in range(2):
                 try:
@@ -114,7 +114,13 @@ async def process_domain(p, domain, semaphore, enhanced_mode=False):
                     break
 
                 except PlaywrightError as e:
-                    if "Target page, context or browser has been closed" in str(e):
+                    error_msg = str(e)
+                    # Dead domain — permanently skip, no point retrying
+                    if "ERR_NAME_NOT_RESOLVED" in error_msg:
+                        logger.error(f"Dead domain (DNS failed): {base_url} — permanently skipping")
+                        await mark_as_not_found(base_url_id, base_url)
+                        return
+                    if "Target page, context or browser has been closed" in error_msg:
                         logger.error(f"Browser crashed while processing {base_url}")
                         raise
                     if attempt == 1:

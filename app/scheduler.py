@@ -10,7 +10,7 @@ from app.worker import run_batch
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_POLL_INTERVAL = 300  # seconds (5 minutes)
+DEFAULT_POLL_INTERVAL = 86400  # seconds (24 hours)
 BATCH_SIZE = 50
 RETRY_BATCH_SIZE = 20
 
